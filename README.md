@@ -202,3 +202,75 @@ Interpretation:
 - **Pseudo fallback**: useful for quick visual preview only (not metrically accurate).
 - **Calibrated XYZ**: real 3D points derived from camera intrinsics + laser plane intersection.
 
+---
+
+## 7) Full hardwareless workflow (Windows/Linux, no Pi hardware)
+
+This project now supports explicit opt-in mock mode via `SCANNER_MOCK_HW=1`.
+
+In mock mode:
+
+- camera frames are synthetic (deterministic RGB gradients)
+- GPIO/stepper/laser calls are simulated
+- production behavior remains unchanged when `SCANNER_MOCK_HW` is not set
+
+### 7.1 Generate synthetic run + calibration fixtures
+
+```bash
+python tools/generate_hardwareless_fixtures.py --run-id synthetic_hwless_test --steps 96
+```
+
+This creates:
+
+- `runs/synthetic_hwless_test/points/step_*.npz`
+- `runs/synthetic_hwless_test/config.json`
+- `runs/synthetic_hwless_test/plan.json`
+- `calibration/calibration.json` (schema-compatible synthetic calibration)
+
+### 7.2 Run local exporter verification harness
+
+```bash
+python tools/run_hardwareless_checks.py --run-id synthetic_hwless_test --steps 96
+```
+
+This runs generation + exporter and verifies the output JSON contains expected fields including triangulated arrays.
+
+### 7.3 Start web server in hardwareless mode
+
+Windows `cmd.exe`:
+
+```bash
+set SCANNER_MOCK_HW=1 && python -m uvicorn webapp:app --host 127.0.0.1 --port 8000
+```
+
+Linux/macOS:
+
+```bash
+SCANNER_MOCK_HW=1 python -m uvicorn webapp:app --host 127.0.0.1 --port 8000
+```
+
+### 7.4 API smoke checks while server is running
+
+```bash
+python tools/hardwareless_api_smoke.py --base http://127.0.0.1:8000 --run-id synthetic_hwless_test
+```
+
+Checks:
+
+- `GET /api/system/mode` (expects `mock_hw=true`)
+- `GET /api/scan/status`
+- `GET /api/calibration/status`
+- `GET /api/runs`
+- `POST /api/runs/<run_id>/export`
+
+### 7.5 Browser GUI validation targets
+
+Validate in browser (manual or MCP automation):
+
+- `/` main status/control page loads
+- `/api/calibration/status` reachable and populated
+- runs list visible on main page and includes synthetic run
+- export trigger works from UI (`POST /api/runs/<run_id>/export`)
+- `/viewer/` opens and is interactive
+
+
