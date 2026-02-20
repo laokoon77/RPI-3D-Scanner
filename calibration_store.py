@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-from .calibration_models import CalibrationData, SCHEMA_VERSION, utc_now_iso
+try:
+    from .calibration_models import CalibrationData, SCHEMA_VERSION, utc_now_iso
+except ImportError:
+    from calibration_models import CalibrationData, SCHEMA_VERSION, utc_now_iso
 
 
 def _require_number(value: Any, field: str) -> float:

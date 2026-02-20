@@ -3,8 +3,10 @@ import threading
 import logging
 import subprocess
 import sys
+import os
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -14,26 +16,44 @@ from fastapi import Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 
-from .scan_runner import ScanController, ScanConfig
-
-from .camera_service import CameraService, CameraSettings
-from .hardware_io import (
-    gpio_open,
-    gpio_close,
-    stepper_init,
-    stepper_enable,
-    stepper_step,
-    laser_init,
-    laser_set,
-)
-from .scan_algo import StripeDetector, StripeParams, capture_pair, jpeg_with_text
-from .background import BackgroundModel, BackgroundParams
-
-from .turntable import Turntable, TurntableConfig
-from .calibration_models import CalibrationData
-from .calibration_store import CalibrationStore
-from .calibration_intrinsics import IntrinsicsCalibrationService
-from .calibration_laser import LaserPlaneCalibrationService
+try:
+    from .scan_runner import ScanController, ScanConfig
+    from .camera_service import CameraService, CameraSettings
+    from .hardware_io import (
+        gpio_open,
+        gpio_close,
+        stepper_init,
+        stepper_enable,
+        stepper_step,
+        laser_init,
+        laser_set,
+    )
+    from .scan_algo import StripeDetector, StripeParams, capture_pair, jpeg_with_text
+    from .background import BackgroundModel, BackgroundParams
+    from .turntable import Turntable, TurntableConfig
+    from .calibration_models import CalibrationData
+    from .calibration_store import CalibrationStore
+    from .calibration_intrinsics import IntrinsicsCalibrationService
+    from .calibration_laser import LaserPlaneCalibrationService
+except ImportError:
+    from scan_runner import ScanController, ScanConfig
+    from camera_service import CameraService, CameraSettings
+    from hardware_io import (
+        gpio_open,
+        gpio_close,
+        stepper_init,
+        stepper_enable,
+        stepper_step,
+        laser_init,
+        laser_set,
+    )
+    from scan_algo import StripeDetector, StripeParams, capture_pair, jpeg_with_text
+    from background import BackgroundModel, BackgroundParams
+    from turntable import Turntable, TurntableConfig
+    from calibration_models import CalibrationData
+    from calibration_store import CalibrationStore
+    from calibration_intrinsics import IntrinsicsCalibrationService
+    from calibration_laser import LaserPlaneCalibrationService
 
 log = logging.getLogger(__name__)
 app = FastAPI()
@@ -52,7 +72,9 @@ LASER2_PIN = 25
 STEPPER_EN_ACTIVE_LOW = False
 STEPPER_HOLD_ON_START = True
 
-camera = CameraService(CameraSettings(size=(1280, 720), jpeg_quality=80, fps=25.0))
+MOCK_HW = str(os.getenv("SCANNER_MOCK_HW", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+camera = CameraService(CameraSettings(size=(1280, 720), jpeg_quality=80, fps=25.0, mock=MOCK_HW))
 detector = StripeDetector(StripeParams())
 
 bg = BackgroundModel(BackgroundParams(fg_threshold=25, morph_ksize=5, dilate_iters=1, use_otsu=False))
@@ -130,6 +152,8 @@ def startup():
 
     if STEPPER_HOLD_ON_START:
         stepper_enable(gpio, stepper, True)
+
+    log.info("startup complete (mock_hw=%s)", MOCK_HW)
 
 
 @app.on_event("shutdown")
@@ -541,7 +565,7 @@ def cam_save_profile(name: str):
     meta = camera.get_latest_metadata() or {}
 
     # Force frozen behavior when applying this profile later
-    prof = {"AeEnable": False, "AwbEnable": False}
+    prof: dict[str, Any] = {"AeEnable": False, "AwbEnable": False}
 
     if "ExposureTime" in meta:
         prof["ExposureTime"] = int(meta["ExposureTime"])
@@ -563,6 +587,11 @@ def cam_save_profile(name: str):
         return JSONResponse({"ok": False, "error": "name must be normal or laser"}, status_code=400)
 
     return {"ok": True, "name": name, "profile": prof}
+
+
+@app.get("/api/system/mode")
+def api_system_mode():
+    return {"ok": True, "mock_hw": bool(MOCK_HW)}
 
 
 

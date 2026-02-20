@@ -10,10 +10,16 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
-from .scan_algo import capture_pair
-from .turntable import Turntable
-from .background import BackgroundModel
-from .scan_algo import StripeDetector
+try:
+    from .scan_algo import capture_pair
+    from .turntable import Turntable
+    from .background import BackgroundModel
+    from .scan_algo import StripeDetector
+except ImportError:
+    from scan_algo import capture_pair
+    from turntable import Turntable
+    from background import BackgroundModel
+    from scan_algo import StripeDetector
 
 
 @dataclass

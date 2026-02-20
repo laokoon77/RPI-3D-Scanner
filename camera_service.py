@@ -8,7 +8,11 @@ from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
-from picamera2 import Picamera2
+
+try:
+    from picamera2 import Picamera2
+except Exception:
+    Picamera2 = None  # type: ignore
 
 log = logging.getLogger(__name__)
 
@@ -30,33 +34,46 @@ class CameraSettings:
     jpeg_quality: int = 80
     hflip: bool = False
     vflip: bool = False
+    mock: bool = False
 
 
 class CameraService:
     def __init__(self, settings: CameraSettings = CameraSettings()):
         self.settings = settings
-        self._picam = Picamera2()
+        self._mock = bool(settings.mock)
+        self._mock_controls: Dict[str, Any] = {}
 
-        transform = None
-        if Transform is not None and (settings.hflip or settings.vflip):
-            transform = Transform(
-                hflip=1 if settings.hflip else 0,
-                vflip=1 if settings.vflip else 0,
+        if not self._mock and Picamera2 is None:
+            raise RuntimeError(
+                "picamera2 is unavailable in this environment. "
+                "Set SCANNER_MOCK_HW=1 to run in hardwareless mode."
             )
 
-        kwargs = {}
-        if transform is not None:
-            kwargs["transform"] = transform
+        self._picam: Any = None
+        if not self._mock:
+            self._picam = Picamera2()
 
-        cfg = self._picam.create_video_configuration(
-            main={"size": settings.size, "format": "RGB888"},
-            **kwargs,
-        )
-        self._picam.configure(cfg)
+        if not self._mock:
+            transform = None
+            if Transform is not None and (settings.hflip or settings.vflip):
+                transform = Transform(
+                    hflip=1 if settings.hflip else 0,
+                    vflip=1 if settings.vflip else 0,
+                )
 
-        if settings.fps:
-            us = int(round(1_000_000 / float(settings.fps)))
-            self._picam.set_controls({"FrameDurationLimits": (us, us)})
+            kwargs = {}
+            if transform is not None:
+                kwargs["transform"] = transform
+
+            cfg = self._picam.create_video_configuration(  # type: ignore[union-attr]
+                main={"size": settings.size, "format": "RGB888"},
+                **kwargs,
+            )
+            self._picam.configure(cfg)  # type: ignore[union-attr]
+
+            if settings.fps:
+                us = int(round(1_000_000 / float(settings.fps)))
+                self._picam.set_controls({"FrameDurationLimits": (us, us)})  # type: ignore[union-attr]
 
         self._lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
@@ -70,20 +87,66 @@ class CameraService:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._picam.start()
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="camera-capture")
+        if not self._mock:
+            self._picam.start()  # type: ignore[union-attr]
+            target = self._capture_loop
+            name = "camera-capture"
+        else:
+            target = self._mock_capture_loop
+            name = "mock-camera-capture"
+        self._thread = threading.Thread(target=target, daemon=True, name=name)
         self._thread.start()
-        log.info("CameraService started")
+        log.info("CameraService started (mock=%s)", self._mock)
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2.0)
-        try:
-            self._picam.stop()
-        except Exception:
-            log.exception("Error stopping camera")
+        if not self._mock:
+            try:
+                self._picam.stop()  # type: ignore[union-attr]
+            except Exception:
+                log.exception("Error stopping camera")
         log.info("CameraService stopped")
+
+    def _generate_mock_frame(self, t0: float) -> tuple[np.ndarray, Dict[str, Any]]:
+        w, h = int(self.settings.size[0]), int(self.settings.size[1])
+        phase = int((t0 * 1000.0) % 255)
+
+        x = np.linspace(0, 255, w, dtype=np.uint8)
+        y = np.linspace(0, 255, h, dtype=np.uint8)
+        xx = np.tile(x, (h, 1))
+        yy = np.tile(y[:, None], (1, w))
+        blue = ((xx.astype(np.uint16) + yy.astype(np.uint16) + phase) % 256).astype(np.uint8)
+
+        frame = np.stack([xx, yy, blue], axis=2)
+
+        meta: Dict[str, Any] = {
+            "MockMode": True,
+            "ExposureTime": int(10_000 + (phase * 5)),
+            "AnalogueGain": 1.5,
+            "ColourGains": (1.0, 1.0),
+            "LensPosition": 1.5,
+        }
+        meta.update(self._mock_controls)
+        return frame, meta
+
+    def _mock_capture_loop(self) -> None:
+        min_dt = 0.0
+        if self.settings.fps:
+            min_dt = 1.0 / max(1.0, float(self.settings.fps))
+
+        while not self._stop.is_set():
+            t0 = time.time()
+            frame, meta = self._generate_mock_frame(t0)
+            with self._lock:
+                self._latest_frame = frame
+                self._latest_meta = meta
+                self._latest_ts = t0
+
+            dt = time.time() - t0
+            if min_dt and dt < min_dt:
+                time.sleep(min_dt - dt)
 
     def _capture_loop(self) -> None:
         min_dt = 0.0
@@ -128,12 +191,17 @@ class CameraService:
         return buf.tobytes() if ok else None
 
     def set_controls(self, controls: Dict[str, Any]) -> None:
+        if self._mock:
+            self._mock_controls.update(dict(controls))
+            return
         try:
             self._picam.set_controls(controls)
         except Exception:
             log.exception("set_controls failed: %s", controls)
 
     def get_camera_controls(self) -> Dict[str, Any]:
+        if self._mock:
+            return dict(self._mock_controls)
         return dict(getattr(self._picam, "camera_controls", {}) or {})
 
     # ---- AF / AE / AWB helpers (best-effort; depends on stack) ----
@@ -188,6 +256,17 @@ class CameraService:
         self.set_controls(controls)
 
     def grab_fresh_frame(self, settle_s: float = 0.05, timeout_s: float = 1.0) -> Optional[np.ndarray]:
+        if self._mock:
+            if settle_s > 0:
+                time.sleep(settle_s)
+            t0 = time.time()
+            frame, meta = self._generate_mock_frame(t0)
+            with self._lock:
+                self._latest_frame = frame
+                self._latest_meta = meta
+                self._latest_ts = t0
+            return frame.copy()
+
         if settle_s > 0:
             time.sleep(settle_s)
 

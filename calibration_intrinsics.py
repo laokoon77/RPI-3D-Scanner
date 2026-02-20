@@ -6,7 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .calibration_models import IntrinsicsCalibration
+try:
+    from .calibration_models import IntrinsicsCalibration
+except ImportError:
+    from calibration_models import IntrinsicsCalibration
 
 
 def checkerboard_object_points(cols: int, rows: int, square_size: float) -> np.ndarray:

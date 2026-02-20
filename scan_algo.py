@@ -6,8 +6,12 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .camera_service import CameraService
-from .hardware_io import laser_set
+try:
+    from .camera_service import CameraService
+    from .hardware_io import laser_set
+except ImportError:
+    from camera_service import CameraService
+    from hardware_io import laser_set
 
 
 @dataclass

@@ -5,8 +5,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .calibration_models import LaserPlaneCalibration
-from .scan_algo import capture_pair
+try:
+    from .calibration_models import LaserPlaneCalibration
+    from .scan_algo import capture_pair
+except ImportError:
+    from calibration_models import LaserPlaneCalibration
+    from scan_algo import capture_pair
 
 
 def plane_fit_svd(points_xyz: np.ndarray) -> Tuple[np.ndarray, Dict[str, float]]:

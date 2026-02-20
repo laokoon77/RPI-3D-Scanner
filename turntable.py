@@ -2,7 +2,10 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from .hardware_io import stepper_step
+try:
+    from .hardware_io import stepper_step
+except ImportError:
+    from hardware_io import stepper_step
 
 @dataclass
 class TurntableConfig:
