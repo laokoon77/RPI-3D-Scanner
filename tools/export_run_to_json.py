@@ -8,6 +8,12 @@ from typing import Any
 
 import numpy as np
 
+from triangulation import (
+    TriangulationCalibration,
+    load_triangulation_calibration,
+    triangulate_pixels_to_world,
+)
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -28,6 +34,25 @@ def _safe_points(arr: np.ndarray) -> list[list[float]]:
     for row in arr:
         out.append([float(row[0]), float(row[1])])
     return out
+
+
+def _as_xy_array(points: list[list[float]]) -> np.ndarray:
+    if not points:
+        return np.zeros((0, 2), dtype=np.float64)
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return np.zeros((0, 2), dtype=np.float64)
+    return arr[:, :2]
+
+
+def _try_load_calibration(calibration_path: Path) -> tuple[TriangulationCalibration | None, str | None]:
+    if not calibration_path.exists():
+        return None, f"calibration file not found: {calibration_path}"
+    try:
+        calib = load_triangulation_calibration(calibration_path)
+        return calib, None
+    except Exception as e:
+        return None, f"invalid calibration file ({calibration_path}): {type(e).__name__}: {e}"
 
 
 def _infer_image_size(steps: list[dict[str, Any]]) -> dict[str, int] | None:
@@ -53,7 +78,14 @@ def _infer_image_size(steps: list[dict[str, Any]]) -> dict[str, int] | None:
     }
 
 
-def export_run(run_dir: Path, output_path: Path, scale_y: float, scale_r: float, x_center: float | None) -> None:
+def export_run(
+    run_dir: Path,
+    output_path: Path,
+    scale_y: float,
+    scale_r: float,
+    x_center: float | None,
+    calibration_path: Path,
+) -> None:
     points_dir = run_dir / "points"
     if not points_dir.exists() or not points_dir.is_dir():
         raise FileNotFoundError(f"missing points directory: {points_dir}")
@@ -62,12 +94,44 @@ def export_run(run_dir: Path, output_path: Path, scale_y: float, scale_r: float,
     if not step_files:
         raise FileNotFoundError(f"no step_*.npz files found in: {points_dir}")
 
+    calibration, calibration_error = _try_load_calibration(calibration_path)
+
+    tri_stats = {
+        "laser1": {"input": 0, "finite": 0, "intersected": 0, "output": 0},
+        "laser2": {"input": 0, "finite": 0, "intersected": 0, "output": 0},
+    }
+
     steps: list[dict[str, Any]] = []
     for idx, npz_path in enumerate(step_files):
         with np.load(npz_path, allow_pickle=False) as data:
             angle_deg = _safe_float(data["angle_deg"][()] if "angle_deg" in data else 0.0)
             laser1 = _safe_points(data["laser1"] if "laser1" in data else np.zeros((0, 2), dtype=np.float32))
             laser2 = _safe_points(data["laser2"] if "laser2" in data else np.zeros((0, 2), dtype=np.float32))
+
+        laser1_xyz: list[list[float]] = []
+        laser2_xyz: list[list[float]] = []
+
+        if calibration is not None:
+            l1_points, l1_s = triangulate_pixels_to_world(
+                _as_xy_array(laser1),
+                angle_deg=angle_deg,
+                k=calibration.k,
+                dist=calibration.dist,
+                plane_abcd=calibration.plane1,
+            )
+            l2_points, l2_s = triangulate_pixels_to_world(
+                _as_xy_array(laser2),
+                angle_deg=angle_deg,
+                k=calibration.k,
+                dist=calibration.dist,
+                plane_abcd=calibration.plane2,
+            )
+            laser1_xyz = l1_points
+            laser2_xyz = l2_points
+
+            for k in tri_stats["laser1"].keys():
+                tri_stats["laser1"][k] += int(l1_s[k])
+                tri_stats["laser2"][k] += int(l2_s[k])
 
         steps.append(
             {
@@ -76,6 +140,8 @@ def export_run(run_dir: Path, output_path: Path, scale_y: float, scale_r: float,
                 "angle_deg": angle_deg,
                 "laser1": laser1,
                 "laser2": laser2,
+                "laser1_xyz": laser1_xyz,
+                "laser2_xyz": laser2_xyz,
             }
         )
 
@@ -99,6 +165,23 @@ def export_run(run_dir: Path, output_path: Path, scale_y: float, scale_r: float,
             "scale_y": float(scale_y),
             "scale_r": float(scale_r),
             "x_center": float(x_center),
+        },
+        "triangulation": {
+            "enabled": bool(calibration is not None),
+            "units": "mm",
+            "coordinate_frame": {
+                "camera": "OpenCV camera coordinates; +Z forward",
+                "world": "camera points rotated by +angle_deg about Y axis",
+            },
+            "calibration": {
+                "path": str(calibration_path),
+                "id": calibration.calibration_id if calibration is not None else None,
+                "schema_version": calibration.schema_version if calibration is not None else None,
+                "updated_at": calibration.updated_at if calibration is not None else None,
+                "valid": bool(calibration is not None),
+                "error": calibration_error,
+            },
+            "stats": tri_stats,
         },
         "image_size": inferred_size,
         "steps": steps,
@@ -127,6 +210,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional image x-center used in pseudo radius mapping (default: inferred from points)",
     )
+    p.add_argument(
+        "--calibration",
+        type=Path,
+        default=Path("calibration/calibration.json"),
+        help="Path to calibration JSON with intrinsics and laser planes (default: calibration/calibration.json)",
+    )
     return p.parse_args()
 
 
@@ -141,6 +230,7 @@ def main() -> int:
         scale_y=float(args.scale_y),
         scale_r=float(args.scale_r),
         x_center=args.x_center,
+        calibration_path=args.calibration,
     )
 
     print(f"Exported {output}")
