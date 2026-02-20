@@ -1,13 +1,18 @@
 import time
 import threading
 import logging
+import subprocess
+import sys
 from dataclasses import asdict
+from pathlib import Path
 
 import cv2
 import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi import Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 
 from .scan_runner import ScanController, ScanConfig
 
@@ -32,6 +37,12 @@ from .calibration_laser import LaserPlaneCalibrationService
 
 log = logging.getLogger(__name__)
 app = FastAPI()
+
+RUNS_ROOT = Path("runs")
+VIEWER_ROOT = Path("viewer")
+EXPORT_TOOL_PATH = Path("tools/export_run_to_json.py")
+
+app.mount("/viewer", StaticFiles(directory=str(VIEWER_ROOT), html=True), name="viewer")
 
 # Physical pin 16 = BCM23, physical pin 22 = BCM25
 LASER1_PIN = 23
@@ -144,6 +155,7 @@ def index():
 <body style="font-family:sans-serif;margin:16px">
   <h2>Pi Scanner</h2>
   <img src="/view.mjpg" style="max-width:100%;border:1px solid #ccc"/>
+  <p><a href="/viewer/" target="_blank">Open viewer</a></p>
 
   <h3>View</h3>
   <button onclick="post('/api/view/mode?mode=live')">Live</button>
@@ -173,21 +185,100 @@ def index():
   <h3>Stepper</h3>
   <button onclick="post('/api/stepper/enable?enabled=1')">Hold ON</button>
   <button onclick="post('/api/stepper/enable?enabled=0')">Hold OFF</button>
+  <button onclick="post('/api/stepper/polarity?en_active_low=0')">Polarity: active HIGH</button>
+  <button onclick="post('/api/stepper/polarity?en_active_low=1')">Polarity: active LOW</button>
   <button onclick="post('/api/step?steps=1600&speed=500&hold=1')">Move ~90° (test)</button>
   <button onclick="post('/api/step?steps=6400&speed=500&hold=1')">Move 360° (test)</button>
   <button onclick="post('/api/step?steps=50&speed=500&hold=1')">Step +50</button>
   <button onclick="post('/api/step?steps=-50&speed=500&hold=1')">Step -50</button>
 
+  <h3>Scan</h3>
+  <label>Step deg <input id="scan_step_deg" type="number" step="0.1" min="0.1" value="2.0"/></label>
+  <label>Span deg <input id="scan_span_deg" type="number" step="1" min="1" max="360" value="360"/></label>
+  <label>Speed <input id="scan_speed" type="number" step="10" min="10" value="320"/></label>
+  <label>Save images <input id="scan_save_images" type="checkbox"/></label>
+  <button onclick="startScan()">Start scan</button>
+  <button onclick="post('/api/scan/stop')">Stop scan</button>
+  <pre id="scan_status" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap"></pre>
+
+  <h3>Runs</h3>
+  <button onclick="loadRuns()">Refresh runs</button>
+  <div id="runs_list"></div>
+
 
 
 <script>
 async function post(url){
-  await fetch(url, {method:'POST'});
+  const r = await fetch(url, {method:'POST'});
+  const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+  if(!j.ok){
+    console.error('POST failed', url, j);
+  }
+  await refreshScanStatus();
+  await loadRuns();
+  return j;
 }
+
+function q(id){ return document.getElementById(id); }
+
+async function startScan(){
+  const stepDeg = encodeURIComponent(q('scan_step_deg').value);
+  const spanDeg = encodeURIComponent(q('scan_span_deg').value);
+  const speed = encodeURIComponent(q('scan_speed').value);
+  const saveImages = q('scan_save_images').checked ? 1 : 0;
+  await post(`/api/scan/start?step_deg=${stepDeg}&span_deg=${spanDeg}&speed=${speed}&save_images=${saveImages}`);
+}
+
+async function refreshScanStatus(){
+  const target = q('scan_status');
+  try{
+    const r = await fetch('/api/scan/status');
+    const j = await r.json();
+    target.textContent = JSON.stringify(j, null, 2);
+  }catch(e){
+    target.textContent = 'status fetch failed: ' + e;
+  }
+}
+
+async function loadRuns(){
+  const target = q('runs_list');
+  try{
+    const r = await fetch('/api/runs');
+    const j = await r.json();
+    if(!j.ok){
+      target.textContent = j.error || 'failed to load runs';
+      return;
+    }
+    if(!j.runs || !j.runs.length){
+      target.textContent = 'No runs found.';
+      return;
+    }
+    target.innerHTML = j.runs.map(run => {
+      const exportFile = run.export_exists ? `<a href="/${run.export_relpath}" target="_blank">open export</a>` : 'no export';
+      return `
+        <div style="margin:6px 0;padding:6px;border:1px solid #ddd">
+          <b>${run.run_id}</b> | steps: ${run.step_files} | ${exportFile}
+          <button onclick="post('/api/runs/${run.run_id}/export')">Export</button>
+        </div>
+      `;
+    }).join('');
+  }catch(e){
+    target.textContent = 'runs fetch failed: ' + e;
+  }
+}
+
+refreshScanStatus();
+loadRuns();
+setInterval(refreshScanStatus, 1000);
 </script>
 </body>
 </html>
 """
+
+
+@app.get("/viewer-home")
+def viewer_home_redirect():
+    return RedirectResponse(url="/viewer/")
 
 
 def run_server(host="0.0.0.0", port=8000):
@@ -376,6 +467,31 @@ def api_stepper_enable(enabled: int):
     return {"ok": True, "enabled": bool(enabled), "en_active_low": stepper.get("en_active_low")}
 
 
+@app.get("/api/stepper/polarity")
+def api_stepper_polarity_get():
+    active_low = bool(stepper.get("en_active_low", False))
+    return {
+        "ok": True,
+        "en_active_low": active_low,
+        "enabled_level": 0 if active_low else 1,
+        "disabled_level": 1 if active_low else 0,
+    }
+
+
+@app.post("/api/stepper/polarity")
+def api_stepper_polarity_set(en_active_low: int):
+    new_value = bool(en_active_low)
+    old_value = bool(stepper.get("en_active_low", False))
+    stepper["en_active_low"] = new_value
+    return {
+        "ok": True,
+        "changed": old_value != new_value,
+        "en_active_low": new_value,
+        "enabled_level": 0 if new_value else 1,
+        "disabled_level": 1 if new_value else 0,
+    }
+
+
 @app.post("/api/move_deg")
 def api_move_deg(deg: float, speed: float = 800.0, hold: int = 1):
     steps = turntable.move_deg(float(deg), speed_sps=float(speed), hold=bool(hold))
@@ -518,6 +634,86 @@ def api_scan_stop():
 @app.get("/api/scan/status")
 def api_scan_status():
     return scan_ctl.status()
+
+
+def _iter_run_dirs(root: Path) -> list[Path]:
+    if not root.exists() or not root.is_dir():
+        return []
+    runs = [p for p in root.iterdir() if p.is_dir()]
+    runs.sort(key=lambda p: p.name, reverse=True)
+    return runs
+
+
+def _run_summary(run_dir: Path) -> dict:
+    points_dir = run_dir / "points"
+    step_files = list(points_dir.glob("step_*.npz")) if points_dir.exists() else []
+    export_path = run_dir / "viewer_export.json"
+    return {
+        "run_id": run_dir.name,
+        "run_relpath": run_dir.as_posix(),
+        "points_relpath": points_dir.as_posix(),
+        "step_files": len(step_files),
+        "export_exists": export_path.exists(),
+        "export_relpath": export_path.as_posix(),
+    }
+
+
+@app.get("/api/runs")
+def api_runs_list(limit: int = 100):
+    lim = max(1, min(int(limit), 1000))
+    runs = _iter_run_dirs(RUNS_ROOT)
+    payload = []
+    for rd in runs:
+        summary = _run_summary(rd)
+        if int(summary["step_files"]) > 0:
+            payload.append(summary)
+        if len(payload) >= lim:
+            break
+    return {"ok": True, "count": len(payload), "runs": payload}
+
+
+@app.post("/api/runs/{run_id}/export")
+def api_runs_export(run_id: str, output_name: str = "viewer_export.json"):
+    if not run_id or "/" in run_id or "\\" in run_id:
+        return JSONResponse({"ok": False, "error": "invalid run_id"}, status_code=400)
+    if not output_name or "/" in output_name or "\\" in output_name:
+        return JSONResponse({"ok": False, "error": "invalid output_name"}, status_code=400)
+    if not output_name.endswith(".json"):
+        return JSONResponse({"ok": False, "error": "output_name must end with .json"}, status_code=400)
+
+    run_dir = RUNS_ROOT / run_id
+    if not run_dir.exists() or not run_dir.is_dir():
+        return JSONResponse({"ok": False, "error": f"run not found: {run_id}"}, status_code=404)
+
+    output_path = run_dir / output_name
+    cmd = [
+        sys.executable,
+        str(EXPORT_TOOL_PATH),
+        str(run_dir),
+        "--output",
+        str(output_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    if proc.returncode != 0:
+        return JSONResponse(
+            {
+                "ok": False,
+                "run_id": run_id,
+                "out_path": output_path.as_posix(),
+                "error": (proc.stderr or proc.stdout or "export failed").strip(),
+                "returncode": proc.returncode,
+            },
+            status_code=500,
+        )
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "out_path": output_path.as_posix(),
+        "exists": output_path.exists(),
+        "stdout": (proc.stdout or "").strip(),
+    }
 
 
 def _calibration_snapshot() -> dict:
