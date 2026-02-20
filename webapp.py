@@ -1,6 +1,7 @@
 import time
 import threading
 import logging
+from dataclasses import asdict
 
 import cv2
 import numpy as np
@@ -24,6 +25,10 @@ from .scan_algo import StripeDetector, StripeParams, capture_pair, jpeg_with_tex
 from .background import BackgroundModel, BackgroundParams
 
 from .turntable import Turntable, TurntableConfig
+from .calibration_models import CalibrationData
+from .calibration_store import CalibrationStore
+from .calibration_intrinsics import IntrinsicsCalibrationService
+from .calibration_laser import LaserPlaneCalibrationService
 
 log = logging.getLogger(__name__)
 app = FastAPI()
@@ -53,6 +58,12 @@ laser_controls = None   # dict or None
 capture_lock = threading.Lock()
 scan_ctl = None
 
+calibration_lock = threading.Lock()
+calibration_store = CalibrationStore("calibration/calibration.json")
+calibration_data = CalibrationData()
+intrinsics_cal = IntrinsicsCalibrationService()
+laser_cal = LaserPlaneCalibrationService()
+
 state_lock = threading.Lock()
 view_mode = "live"       # "live" or "overlay"
 active_laser = 1         # 1 or 2
@@ -61,7 +72,7 @@ lasers_enabled = False   # if False => ALWAYS show "LASERS OFF" overlay
 
 @app.on_event("startup")
 def startup():
-    global gpio, stepper, laser1, laser2, turntable
+    global gpio, stepper, laser1, laser2, turntable, calibration_data
     
     camera.start()
 
@@ -96,6 +107,13 @@ def startup():
         capture_lock=capture_lock,
         get_profiles_callable=_get_profiles,
     )
+
+    try:
+        calibration_data = calibration_store.load()
+        log.info("Loaded calibration from %s", calibration_store.path)
+    except Exception as e:
+        calibration_data = calibration_store.default()
+        log.exception("Failed to load calibration (%s), using defaults", e)
 
 
 
@@ -500,3 +518,192 @@ def api_scan_stop():
 @app.get("/api/scan/status")
 def api_scan_status():
     return scan_ctl.status()
+
+
+def _calibration_snapshot() -> dict:
+    with calibration_lock:
+        data = calibration_data
+    payload = data.to_dict()
+    payload["intrinsics_ready"] = data.intrinsics is not None
+    payload["lasers_ready"] = data.laser1 is not None and data.laser2 is not None
+    return payload
+
+
+def _get_intrinsics_matrix() -> np.ndarray:
+    with calibration_lock:
+        intr = calibration_data.intrinsics
+    if intr is None:
+        raise RuntimeError("intrinsics not solved or loaded")
+    return np.array(intr.camera_matrix, dtype=np.float64)
+
+
+@app.get("/api/calibration/status")
+def api_calibration_status():
+    return {
+        "ok": True,
+        "store_path": str(calibration_store.path),
+        "data": _calibration_snapshot(),
+        "intrinsics_session": intrinsics_cal.status(),
+        "laser_session": laser_cal.status(),
+    }
+
+
+@app.post("/api/calibration/intrinsics/start")
+def api_calibration_intrinsics_start(
+    board_type: str = "checkerboard",
+    checkerboard_cols: int = 9,
+    checkerboard_rows: int = 6,
+    square_size_m: float = 0.01,
+    min_frames: int = 12,
+    charuco_squares_x: int = 7,
+    charuco_squares_y: int = 5,
+    charuco_square_length_m: float = 0.02,
+    charuco_marker_length_m: float = 0.015,
+    aruco_dict_name: str = "DICT_4X4_50",
+):
+    try:
+        status = intrinsics_cal.start(
+            board_type=board_type,
+            checkerboard_cols=int(checkerboard_cols),
+            checkerboard_rows=int(checkerboard_rows),
+            square_size_m=float(square_size_m),
+            min_frames=int(min_frames),
+            charuco_squares_x=int(charuco_squares_x),
+            charuco_squares_y=int(charuco_squares_y),
+            charuco_square_length_m=float(charuco_square_length_m),
+            charuco_marker_length_m=float(charuco_marker_length_m),
+            aruco_dict_name=str(aruco_dict_name),
+        )
+        return {"ok": True, "status": status}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/calibration/intrinsics/capture")
+def api_calibration_intrinsics_capture(settle_s: float = 0.05):
+    with capture_lock:
+        frame = camera.grab_fresh_frame(settle_s=float(settle_s))
+    if frame is None:
+        return JSONResponse({"ok": False, "error": "camera frame unavailable"}, status_code=500)
+    try:
+        return intrinsics_cal.capture(frame)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/calibration/intrinsics/solve")
+def api_calibration_intrinsics_solve():
+    global calibration_data
+    try:
+        result = intrinsics_cal.solve()
+        with calibration_lock:
+            calibration_data.intrinsics = result
+        return {"ok": True, "intrinsics": asdict(result), "quality": result.quality}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/calibration/laser/start")
+def api_calibration_laser_start(
+    board_a: float = 0.0,
+    board_b: float = 0.0,
+    board_c: float = 1.0,
+    board_d: float = -0.30,
+    min_points_per_laser: int = 200,
+):
+    try:
+        status = laser_cal.start(
+            board_plane=[float(board_a), float(board_b), float(board_c), float(board_d)],
+            min_points_per_laser=int(min_points_per_laser),
+        )
+        return {"ok": True, "status": status}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/calibration/laser/capture")
+def api_calibration_laser_capture(
+    laser: int,
+    settle_s: float = 0.06,
+    drop_n: int = 2,
+):
+    if laser not in (1, 2):
+        return JSONResponse({"ok": False, "error": "laser must be 1 or 2"}, status_code=400)
+    try:
+        intrinsics_k = _get_intrinsics_matrix()
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+    target = laser1 if int(laser) == 1 else laser2
+    with capture_lock:
+        try:
+            return laser_cal.capture(
+                laser_index=int(laser),
+                camera=camera,
+                gpio=gpio,
+                laser=target,
+                detector=detector,
+                intrinsics_k=intrinsics_k,
+                settle_s=float(settle_s),
+                drop_n=int(drop_n),
+            )
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/calibration/laser/solve")
+def api_calibration_laser_solve():
+    global calibration_data
+    try:
+        intrinsics_k = _get_intrinsics_matrix()
+        solved = laser_cal.solve(intrinsics_k)
+        with calibration_lock:
+            calibration_data.laser1 = solved.get(1)
+            calibration_data.laser2 = solved.get(2)
+        return {
+            "ok": True,
+            "laser1": asdict(solved[1]),
+            "laser2": asdict(solved[2]),
+        }
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/calibration/save")
+def api_calibration_save():
+    global calibration_data
+    try:
+        with calibration_lock:
+            saved = calibration_store.save(calibration_data)
+            calibration_data = saved
+        return {"ok": True, "store_path": str(calibration_store.path), "data": saved.to_dict()}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.post("/api/calibration/load")
+def api_calibration_load():
+    global calibration_data
+    try:
+        loaded = calibration_store.load()
+        with calibration_lock:
+            calibration_data = loaded
+        return {"ok": True, "store_path": str(calibration_store.path), "data": loaded.to_dict()}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.post("/api/calibration/reset")
+def api_calibration_reset():
+    global calibration_data
+    try:
+        reset_data = calibration_store.reset()
+        with calibration_lock:
+            calibration_data = reset_data
+        intrinsics_cal.session = None
+        intrinsics_cal.last_result = None
+        laser_cal.session = None
+        laser_cal.last_result = {}
+        return {"ok": True, "store_path": str(calibration_store.path), "data": reset_data.to_dict()}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
