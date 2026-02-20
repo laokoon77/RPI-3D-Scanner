@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RPI Scanner Viewer</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div id="topbar">
+    <div class="title-wrap">
+      <h1>RPI Scanner WebGL Viewer</h1>
+      <p class="warning">Preview (not metrically accurate yet)</p>
+    </div>
+
+    <div class="controls-grid">
+      <label class="file-picker">
+        <input id="fileInput" type="file" accept=".json,application/json" />
+        Load export JSON
+      </label>
+
+      <label>
+        <input id="showLaser1" type="checkbox" checked />
+        Show laser 1
+      </label>
+      <label>
+        <input id="showLaser2" type="checkbox" checked />
+        Show laser 2
+      </label>
+      <label>
+        <input id="showWire" type="checkbox" checked />
+        Show wireframe
+      </label>
+
+      <label>
+        Point size
+        <input id="pointSize" type="range" min="1" max="8" step="1" value="2" />
+      </label>
+
+      <label>
+        Row decimation (keep every Nth point)
+        <input id="rowDecimation" type="number" min="1" step="1" value="2" />
+      </label>
+
+      <label>
+        Step decimation (keep every Nth step)
+        <input id="stepDecimation" type="number" min="1" step="1" value="1" />
+      </label>
+
+      <label>
+        Inter-step matching
+        <select id="linkMode">
+          <option value="nearest_y" selected>Nearest Y (default)</option>
+          <option value="same_index">Same sorted index</option>
+        </select>
+      </label>
+
+      <label>
+        Color mode
+        <select id="colorMode">
+          <option value="laser" selected>By laser</option>
+          <option value="step">By step angle</option>
+        </select>
+      </label>
+
+      <label>
+        scale_y
+        <input id="scaleY" type="number" step="0.001" value="0.01" />
+      </label>
+
+      <label>
+        scale_r
+        <input id="scaleR" type="number" step="0.001" value="0.01" />
+      </label>
+
+      <label>
+        x_center
+        <input id="xCenter" type="number" step="0.1" value="640" />
+      </label>
+
+      <button id="rebuildBtn" type="button">Rebuild geometry</button>
+    </div>
+  </div>
+
+  <div id="viewer"></div>
+
+  <div id="status">Load a JSON export from tools/export_run_to_json.py</div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
+
