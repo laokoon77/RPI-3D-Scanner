@@ -315,7 +315,7 @@ def index():
   <p>
     <label for="charuco_total_steps"><b>Number of steps</b></label>
     <input id="charuco_total_steps" type="number" min="5" max="60" step="1" value="10" style="width:90px"/>
-    <button onclick="startManualCharucoWorkflow()">Start</button>
+    <button id="charuco_start_btn" onclick="startManualCharucoWorkflow()">Start</button>
     <button onclick="captureManualCharucoStep()">Capture Step</button>
     <button onclick="solveManualCharucoWorkflow()">Finish &amp; Check</button>
   </p>
@@ -522,14 +522,18 @@ async function refreshManualCharucoStatus(){
 }
 
 async function startManualCharucoWorkflow(){
-  const rawSteps = Number(q('charuco_total_steps').value);
+  const stepsInput = q('charuco_total_steps');
+  const rawSteps = Number(stepsInput?.value ?? 10);
   const safeSteps = Number.isFinite(rawSteps) ? Math.max(5, Math.min(60, Math.round(rawSteps))) : 10;
-  q('charuco_total_steps').value = String(safeSteps);
-  const r = await fetch(`/api/calibration/intrinsics/charuco-manual/start?total_steps=${encodeURIComponent(safeSteps)}`, {method:'POST'});
-  const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+  if(stepsInput) stepsInput.value = String(safeSteps);
+  const j = await post(`/api/calibration/intrinsics/charuco-manual/start?total_steps=${encodeURIComponent(safeSteps)}`);
   renderManualCharucoStatus(j);
   return j;
 }
+
+// Backward-compatible aliases for older inline handlers/pages.
+window.startGuidedCharucoWorkflow = startManualCharucoWorkflow;
+window.startManualCharucoCalib = startManualCharucoWorkflow;
 
 async function captureManualCharucoStep(){
   const r = await fetch('/api/calibration/intrinsics/charuco-manual/capture', {method:'POST'});
@@ -1134,6 +1138,7 @@ def api_calibration_intrinsics_charuco_manual_start(
 ):
     try:
         safe_total_steps = max(5, min(int(total_steps), 60))
+        log.info("guided charuco start requested (total_steps=%s)", safe_total_steps)
         status = guided_charuco.start(
             total_steps=safe_total_steps,
             min_frames_required=int(min_frames),
