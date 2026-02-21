@@ -64,6 +64,10 @@ EXPORT_TOOL_PATH = Path("tools/export_run_to_json.py")
 
 app.mount("/viewer", StaticFiles(directory=str(VIEWER_ROOT), html=True), name="viewer")
 
+# Serve run export JSON files so the viewer "open export" links work
+RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+app.mount("/runs", StaticFiles(directory=str(RUNS_ROOT)), name="runs")
+
 # Physical pin 16 = BCM23, physical pin 22 = BCM25
 LASER1_PIN = 23
 LASER2_PIN = 25
