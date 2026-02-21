@@ -115,16 +115,22 @@ Optional maintenance:
 
 ---
 
-## 4) Scan workflow
+## 4) Scan workflow (OFF/ON-only default)
 
-Before scan, preflight checks in [`_scan_preflight_errors()`](webapp.py:569) require:
+Default scan path no longer requires pure empty-background capture.
 
-1. background captured
-2. NORMAL profile saved
-3. LASER profile saved
-4. lasers explicitly enabled
+Before scan, preflight checks in [`_scan_preflight_errors()`](webapp.py) require:
 
-### 4.1 Prepare camera/background from UI
+1. NORMAL profile saved
+2. LASER profile saved
+3. lasers explicitly enabled
+
+Legacy background path is now optional and disabled by default via env flag:
+
+- `SCANNER_ENABLE_LEGACY_BACKGROUND_PATH=0` (default): no background preflight requirement.
+- `SCANNER_ENABLE_LEGACY_BACKGROUND_PATH=1`: re-enables legacy background capture flow and background preflight gate.
+
+### 4.1 Prepare camera from UI
 
 In `http://<pi-ip>:8000/`:
 
@@ -132,8 +138,12 @@ In `http://<pi-ip>:8000/`:
 2. save profiles:
    - **Save NORMAL profile**
    - **Save LASER profile**
-3. remove object and click **Capture background**
-4. click **Allow lasers (overlay blinking)**
+3. click **Allow lasers (overlay blinking)**
+
+Optional rollback flow (legacy only):
+
+- enable `SCANNER_ENABLE_LEGACY_BACKGROUND_PATH=1`
+- remove object and click **Capture legacy background (optional)**
 
 ### 4.2 Start scan
 
@@ -147,6 +157,12 @@ Monitor status:
 
 ```bash
 curl "http://<pi-ip>:8000/api/scan/status"
+```
+
+Detector telemetry (scan + preview diagnostics):
+
+```bash
+curl "http://<pi-ip>:8000/api/detector/telemetry"
 ```
 
 Stop scan:

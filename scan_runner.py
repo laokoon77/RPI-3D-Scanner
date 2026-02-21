@@ -42,8 +42,9 @@ class ScanConfig:
     # if span is not 360, include last capture at end angle
     include_end_capture: bool = True
 
-    # safety
-    require_background: bool = True
+    # safety / acceptance
+    require_background: bool = False
+    min_detection_confidence: float = 0.12
 
 
 @dataclass
@@ -63,6 +64,7 @@ class ScanStatus:
     total_captures: int = 0
     message: str = ""
     error: Optional[str] = None
+    telemetry: Optional[Dict[str, Any]] = None
 
 
 def _now_run_id() -> str:
@@ -133,12 +135,18 @@ class ScanController:
         self._thread: Optional[threading.Thread] = None
         self._status = ScanStatus()
         self._status_lock = threading.Lock()
+        self._latest_telemetry: Dict[str, Any] = {}
 
     # ---------- public API ----------
 
     def status(self) -> Dict[str, Any]:
         with self._status_lock:
-            return asdict(self._status)
+            out = asdict(self._status)
+        out["detector_telemetry"] = dict(self._latest_telemetry)
+        return out
+
+    def detector_telemetry(self) -> Dict[str, Any]:
+        return dict(self._latest_telemetry)
 
     def is_running(self) -> bool:
         with self._status_lock:
@@ -216,7 +224,7 @@ class ScanController:
 
                     # 1) NORMAL frame (for object mask)
                     if normal_controls:
-                        self.camera.set_controls(normal_controls)
+                        self.camera.apply_locked_controls(normal_controls, settle_s=max(0.02, cfg.capture_settle_s), drop_n=1)
                     ambient_normal = self.camera.grab_fresh_frame(settle_s=cfg.capture_settle_s)
 
                     if ambient_normal is None:
@@ -226,23 +234,45 @@ class ScanController:
 
                     # 2) LASER1 pair (laser profile)
                     if laser_controls:
-                        self.camera.set_controls(laser_controls)
+                        self.camera.apply_locked_controls(laser_controls, settle_s=max(0.02, cfg.capture_settle_s), drop_n=1)
                     a1, l1 = capture_pair(
                         self.camera, self.gpio, self.laser1,
-                        settle_s=cfg.capture_settle_s, drop_n=cfg.drop_n
+                        settle_s=cfg.capture_settle_s,
+                        drop_n=cfg.drop_n,
+                        off_controls=normal_controls,
+                        on_controls=laser_controls,
+                        retry_n=2,
                     )
                     if a1 is None or l1 is None:
                         raise RuntimeError("camera returned None (laser1 pair)")
-                    pts1, _ = self.detector.detect(a1, l1, object_mask=obj_mask)
+                    det1 = self.detector.detect_details(a1, l1, object_mask=obj_mask, mode="scan")
+                    pts1 = det1.points if det1.confidence >= float(cfg.min_detection_confidence) else []
 
                     # 3) LASER2 pair
                     a2, l2 = capture_pair(
                         self.camera, self.gpio, self.laser2,
-                        settle_s=cfg.capture_settle_s, drop_n=cfg.drop_n
+                        settle_s=cfg.capture_settle_s,
+                        drop_n=cfg.drop_n,
+                        off_controls=normal_controls,
+                        on_controls=laser_controls,
+                        retry_n=2,
                     )
                     if a2 is None or l2 is None:
                         raise RuntimeError("camera returned None (laser2 pair)")
-                    pts2, _ = self.detector.detect(a2, l2, object_mask=obj_mask)
+                    det2 = self.detector.detect_details(a2, l2, object_mask=obj_mask, mode="scan")
+                    pts2 = det2.points if det2.confidence >= float(cfg.min_detection_confidence) else []
+
+                    self._latest_telemetry = {
+                        "step_index": int(i),
+                        "angle_deg": float(angle_deg),
+                        "laser1": dict(det1.telemetry),
+                        "laser2": dict(det2.telemetry),
+                        "laser1_confidence": float(det1.confidence),
+                        "laser2_confidence": float(det2.confidence),
+                        "accepted_laser1": bool(det1.confidence >= float(cfg.min_detection_confidence)),
+                        "accepted_laser2": bool(det2.confidence >= float(cfg.min_detection_confidence)),
+                        "min_detection_confidence": float(cfg.min_detection_confidence),
+                    }
 
                 # ---------- store results ----------
                 # Save as numpy arrays (x,y in image coords)
@@ -254,6 +284,7 @@ class ScanController:
                     angle_deg=np.float32(angle_deg),
                     laser1=arr1,
                     laser2=arr2,
+                    telemetry_json=np.array([json.dumps(self._latest_telemetry)], dtype=object),
                 )
 
                 # Optional debug images every N steps
@@ -262,8 +293,10 @@ class ScanController:
                     if obj_mask is not None:
                         cv2.imwrite(str(out_dir / "debug" / f"mask_{i:04d}.png"), obj_mask)
 
-                    _write_jpg_rgb(out_dir / "debug" / f"laser1_{i:04d}.jpg", l1, quality=85)
-                    _write_jpg_rgb(out_dir / "debug" / f"laser2_{i:04d}.jpg", l2, quality=85)
+                    img1 = self.detector.overlay_result_jpeg(l1, det1, quality=85, object_mask=obj_mask, title=f"L1 conf={det1.confidence:.3f}")
+                    img2 = self.detector.overlay_result_jpeg(l2, det2, quality=85, object_mask=obj_mask, title=f"L2 conf={det2.confidence:.3f}")
+                    (out_dir / "debug" / f"laser1_{i:04d}.jpg").write_bytes(img1)
+                    (out_dir / "debug" / f"laser2_{i:04d}.jpg").write_bytes(img2)
 
                 # ---------- move to next position ----------
                 if i < plan.captures_count - 1:
@@ -271,7 +304,7 @@ class ScanController:
                     self.turntable.move_deg(step_deg, speed_sps=cfg.move_speed_sps, hold=True)
                     time.sleep(cfg.settle_after_move_s)
 
-            self._set_status(running=False, message="Done")
+            self._set_status(running=False, message="Done", telemetry=dict(self._latest_telemetry))
 
         except Exception as e:
-            self._set_status(running=False, error=f"{type(e).__name__}: {e}", message="Error")
+            self._set_status(running=False, error=f"{type(e).__name__}: {e}", message="Error", telemetry=dict(self._latest_telemetry))

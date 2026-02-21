@@ -73,6 +73,7 @@ STEPPER_EN_ACTIVE_LOW = False
 STEPPER_HOLD_ON_START = True
 
 MOCK_HW = str(os.getenv("SCANNER_MOCK_HW", "")).strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_LEGACY_BACKGROUND_PATH = str(os.getenv("SCANNER_ENABLE_LEGACY_BACKGROUND_PATH", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 camera = CameraService(CameraSettings(size=(1280, 720), jpeg_quality=80, fps=25.0, mock=MOCK_HW))
 detector = StripeDetector(StripeParams())
@@ -101,6 +102,7 @@ state_lock = threading.Lock()
 view_mode = "live"       # "live" or "overlay"
 active_laser = 1         # 1 or 2
 lasers_enabled = False   # if False => ALWAYS show "LASERS OFF" overlay
+latest_detector_telemetry: dict[str, Any] = {}
 
 
 @app.on_event("startup")
@@ -189,8 +191,8 @@ def index():
   <button onclick="post('/api/lasers/enabled?enabled=1')">Allow lasers (overlay blinking)</button>
   <button onclick="post('/api/lasers/enabled?enabled=0')">Lasers OFF (always)</button>
 
-  <h3>Background</h3>
-  <button onclick="post('/api/background/capture?n=15')">Capture background (remove object!)</button>
+  <h3>Background (optional legacy path)</h3>
+  <button onclick="post('/api/background/capture?n=15')">Capture legacy background (optional)</button>
   <a href="/debug/objectmask.jpg" target="_blank">Open debug object mask</a>
 
   <h3>Camera</h3>
@@ -224,6 +226,9 @@ def index():
   <button onclick="startScan()">Start scan</button>
   <button onclick="post('/api/scan/stop')">Stop scan</button>
   <pre id="scan_status" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap"></pre>
+
+  <h3>Detector diagnostics</h3>
+  <pre id="detector_diag" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap"></pre>
 
   <h3>Runs</h3>
   <button onclick="loadRuns()">Refresh runs</button>
@@ -264,6 +269,17 @@ async function refreshScanStatus(){
   }
 }
 
+async function refreshDetectorDiag(){
+  const target = q('detector_diag');
+  try{
+    const r = await fetch('/api/detector/telemetry');
+    const j = await r.json();
+    target.textContent = JSON.stringify(j, null, 2);
+  }catch(e){
+    target.textContent = 'detector telemetry fetch failed: ' + e;
+  }
+}
+
 async function loadRuns(){
   const target = q('runs_list');
   try{
@@ -292,8 +308,10 @@ async function loadRuns(){
 }
 
 refreshScanStatus();
+refreshDetectorDiag();
 loadRuns();
 setInterval(refreshScanStatus, 1000);
+setInterval(refreshDetectorDiag, 1000);
 </script>
 </body>
 </html>
@@ -353,14 +371,24 @@ def view_stream():
                         if ambient_laser is None or laser_frame is None:
                             jpeg = jpeg_with_text(frame, "NO CAMERA FRAME", quality=camera.settings.jpeg_quality)
                         else:
-                            pts, _ = detector.detect(ambient_laser, laser_frame, object_mask=obj_mask)
-                            if not pts:
+                            det = detector.detect_details(ambient_laser, laser_frame, object_mask=obj_mask, mode="scan")
+                            with state_lock:
+                                latest_detector_telemetry.clear()
+                                latest_detector_telemetry.update({
+                                    "source": "overlay_preview",
+                                    "active_laser": int(laser_sel),
+                                    "confidence": float(det.confidence),
+                                    "telemetry": dict(det.telemetry),
+                                })
+                            if not det.points:
                                 jpeg = jpeg_with_text(laser_frame, "NO STRIPE", quality=camera.settings.jpeg_quality)
                             else:
-                                jpeg = detector.overlay_jpeg(
-                                    laser_frame, pts,
+                                jpeg = detector.overlay_result_jpeg(
+                                    laser_frame,
+                                    det,
                                     quality=camera.settings.jpeg_quality,
-                                    object_mask=obj_mask
+                                    object_mask=obj_mask,
+                                    title=f"L{laser_sel} conf={det.confidence:.3f}",
                                 )
                         delay = 0.25
 
@@ -425,6 +453,8 @@ def api_lasers_enabled(enabled: int):
 
 @app.post("/api/background/capture")
 def api_background_capture(n: int = 15, settle_s: float = 0.05):
+    if not ENABLE_LEGACY_BACKGROUND_PATH:
+        return JSONResponse({"ok": False, "error": "legacy background path disabled by feature flag"}, status_code=404)
     laser_set(gpio, laser1, False)
     laser_set(gpio, laser2, False)
 
@@ -444,6 +474,14 @@ def api_background_capture(n: int = 15, settle_s: float = 0.05):
 
 @app.get("/debug/objectmask.jpg")
 def debug_objectmask():
+    if not ENABLE_LEGACY_BACKGROUND_PATH:
+        f = camera.get_latest_frame()
+        if f is None:
+            return Response(content=b"", media_type="image/jpeg")
+        return Response(
+            content=jpeg_with_text(f, "LEGACY BACKGROUND PATH DISABLED", quality=camera.settings.jpeg_quality),
+            media_type="image/jpeg",
+        )
     frame = camera.get_latest_frame()
     if frame is None:
         return Response(content=b"", media_type="image/jpeg")
@@ -591,12 +629,16 @@ def cam_save_profile(name: str):
 
 @app.get("/api/system/mode")
 def api_system_mode():
-    return {"ok": True, "mock_hw": bool(MOCK_HW)}
+    return {
+        "ok": True,
+        "mock_hw": bool(MOCK_HW),
+        "legacy_background_path_enabled": bool(ENABLE_LEGACY_BACKGROUND_PATH),
+    }
 
 
 
 def _scan_preflight_errors() -> str | None:
-    if not bg.is_ready():
+    if ENABLE_LEGACY_BACKGROUND_PATH and not bg.is_ready():
         return "No background captured. Use 'Capture background (remove object!)' first."
 
     if normal_controls is None:
@@ -615,6 +657,18 @@ def _scan_preflight_errors() -> str | None:
         return "Lasers are disabled. Click 'Allow lasers (overlay blinking)' before scanning."
 
     return None
+
+
+@app.get("/api/detector/telemetry")
+def api_detector_telemetry():
+    payload = scan_ctl.detector_telemetry() if scan_ctl is not None else {}
+    with state_lock:
+        preview = dict(latest_detector_telemetry)
+    return {
+        "ok": True,
+        "scan": payload,
+        "preview": preview,
+    }
 
 
 
@@ -650,7 +704,8 @@ def api_scan_start(
         move_speed_sps=float(speed),
         save_debug_images=bool(save_images),
         include_end_capture=True,
-        require_background=True,
+        require_background=bool(ENABLE_LEGACY_BACKGROUND_PATH),
+        min_detection_confidence=0.12,
     )
     return scan_ctl.start(cfg)
 
