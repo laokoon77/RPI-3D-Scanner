@@ -168,7 +168,13 @@ class IntrinsicsCalibrationService:
             float(s.charuco_marker_length_m),
             dictionary,
         )
-        corners, ids, _rej = cv2.aruco.detectMarkers(gray, dictionary)
+        if hasattr(cv2.aruco, "detectMarkers"):
+            corners, ids, _rej = cv2.aruco.detectMarkers(gray, dictionary)
+        elif hasattr(cv2.aruco, "ArucoDetector"):
+            detector = cv2.aruco.ArucoDetector(dictionary)
+            corners, ids, _rej = detector.detectMarkers(gray)
+        else:
+            return False, "aruco marker detector unavailable"
         if ids is None or len(ids) < 4:
             return False, "not enough aruco markers"
 
@@ -414,6 +420,45 @@ class GuidedCharucoWorkflowService:
             return "Step not accepted. Camera frame was unavailable. Please retry."
         return "Step not accepted. Move the board, keep it fully visible, and try again."
 
+    @staticmethod
+    def _capture_reason_details(reason: str) -> Tuple[str, str, str]:
+        reason_l = str(reason).strip().lower()
+        if "aruco marker detector unavailable" in reason_l:
+            return (
+                "aruco_detector_unavailable",
+                "Could not detect board markers in this OpenCV build.",
+                "Install an OpenCV build with ArUco marker detection support, then retry guided capture.",
+            )
+        if "charuco not available" in reason_l:
+            return (
+                "charuco_runtime_unavailable",
+                "ChArUco detection is unavailable in this environment.",
+                "Install OpenCV contrib with ChArUco support, then retry guided capture.",
+            )
+        if "not enough aruco markers" in reason_l:
+            return (
+                "not_enough_aruco_markers",
+                "Board was not detected clearly enough.",
+                "Keep the whole board in view, improve lighting, and move a little closer.",
+            )
+        if "not enough charuco corners" in reason_l:
+            return (
+                "not_enough_charuco_corners",
+                "Board corners were too incomplete for this step.",
+                "Keep the board flat in frame with sharper focus and less blur, then retry.",
+            )
+        if "empty frame" in reason_l:
+            return (
+                "empty_frame",
+                "Camera frame was unavailable for this capture.",
+                "Wait a moment and press Capture Step again.",
+            )
+        return (
+            "capture_not_accepted",
+            "Step was not accepted.",
+            "Move the board to a different angle, keep it fully visible, and retry.",
+        )
+
     def status(self) -> Dict[str, Any]:
         s = self.session
         if s is None:
@@ -455,6 +500,9 @@ class GuidedCharucoWorkflowService:
                 "ok": True,
                 "step_capture": False,
                 "reason": "already solved",
+                "reason_code": "already_solved",
+                "message": "Calibration is already finished.",
+                "hint": "Use Start Guided Workflow to begin a new capture session.",
                 "status": self.status(),
             }
         if s.captures_attempted >= s.total_steps:
@@ -464,12 +512,16 @@ class GuidedCharucoWorkflowService:
                 "ok": False,
                 "step_capture": False,
                 "reason": "all steps already captured",
+                "reason_code": "all_steps_already_captured",
+                "message": "All capture steps are already used.",
+                "hint": "Press Finish & Check to solve calibration, or restart guided workflow.",
                 "status": self.status(),
             }
 
         capture = self._intrinsics.capture(rgb)
         accepted = bool(capture.get("accepted", False))
         reason = str(capture.get("reason", ""))
+        reason_code, message, hint = self._capture_reason_details(reason)
         s.captures_attempted += 1
         s.accepted_frames = int(capture.get("frames_used", s.accepted_frames))
         s.last_detection_result = reason
@@ -483,6 +535,17 @@ class GuidedCharucoWorkflowService:
                 "step_capture": True,
                 "accepted": accepted,
                 "reason": reason,
+                "reason_code": "step_accepted" if accepted else reason_code,
+                "message": (
+                    "Step accepted."
+                    if accepted
+                    else message
+                ),
+                "hint": (
+                    "Move the board to a new angle and capture the next step."
+                    if accepted
+                    else hint
+                ),
                 "status": self.status(),
             }
 
@@ -493,6 +556,17 @@ class GuidedCharucoWorkflowService:
                 "step_capture": True,
                 "accepted": accepted,
                 "reason": reason,
+                "reason_code": "step_accepted" if accepted else reason_code,
+                "message": (
+                    "Final step captured."
+                    if accepted
+                    else message
+                ),
+                "hint": (
+                    "Finishing calibration now."
+                    if accepted
+                    else hint
+                ),
             }
         )
         return solved_payload

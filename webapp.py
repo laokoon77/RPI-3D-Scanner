@@ -498,9 +498,15 @@ function renderManualCharucoStatus(payload){
   );
 
   const feedback = q('charuco_step_feedback');
-  const msg = String(status.last_step_message || payload?.last_step_message || 'Not started');
+  const msg = String(
+    payload?.message ||
+    status.last_step_message ||
+    payload?.last_step_message ||
+    'Not started'
+  );
+  const hint = String(payload?.hint || '');
   const ok = Boolean(status.last_step_ok ?? payload?.last_step_ok);
-  feedback.textContent = msg;
+  feedback.textContent = hint ? `${msg} ${hint}` : msg;
   if(msg.toLowerCase().includes('not started')){
     feedback.style.background = '#f3f4f6';
     feedback.style.color = '#111827';
@@ -587,9 +593,9 @@ refreshDetectorDiag();
 loadRuns();
 readCameraState();
 refreshManualCharucoStatus();
-setInterval(refreshScanStatus, 1000);
-setInterval(refreshDetectorDiag, 1000);
-setInterval(readCameraState, 2000);
+setInterval(() => { if(!document.hidden) refreshScanStatus(); }, 3000);
+setInterval(() => { if(!document.hidden) refreshDetectorDiag(); }, 3000);
+setInterval(() => { if(!document.hidden) readCameraState(); }, 4000);
 
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){
@@ -1243,7 +1249,17 @@ def api_calibration_intrinsics_charuco_manual_capture(settle_s: float = 0.05):
     with capture_lock:
         frame = camera.grab_fresh_frame(settle_s=float(settle_s))
     if frame is None:
-        return JSONResponse({"ok": False, "error": "camera frame unavailable"}, status_code=500)
+        log.warning("guided charuco capture rejected reason_code=camera_frame_unavailable")
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "camera frame unavailable",
+                "reason_code": "camera_frame_unavailable",
+                "message": "Could not capture a camera frame.",
+                "hint": "Wait a moment and press Capture Step again.",
+            },
+            status_code=500,
+        )
     try:
         payload = guided_charuco.capture_step(frame)
         intrinsics_obj = payload.get("intrinsics")
@@ -1259,9 +1275,23 @@ def api_calibration_intrinsics_charuco_manual_capture(settle_s: float = 0.05):
             payload["step_text"] = str(status.get("step_text", "Step 0 of 0"))
             payload["last_step_ok"] = bool(status.get("last_step_ok", False))
             payload["last_step_message"] = str(status.get("last_step_message", "Capture complete."))
+        if isinstance(payload, dict) and not bool(payload.get("ok", False)):
+            reason_code = str(payload.get("reason_code", "guided_capture_not_accepted"))
+            log.info("guided charuco capture not accepted reason_code=%s", reason_code)
         return payload
     except Exception as e:
-        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+        err = f"{type(e).__name__}: {e}"
+        log.warning("guided charuco capture failed reason_code=guided_capture_exception error=%s", err)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": err,
+                "reason_code": "guided_capture_exception",
+                "message": "This capture step could not be processed.",
+                "hint": "Keep the full board visible and try Capture Step again.",
+            },
+            status_code=400,
+        )
 
 
 @app.post("/api/calibration/intrinsics/charuco-manual/solve")
