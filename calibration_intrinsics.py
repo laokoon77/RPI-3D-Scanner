@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 try:
     from .calibration_models import IntrinsicsCalibration
@@ -44,13 +47,46 @@ def mean_reprojection_error(
     return err_sum / float(n)
 
 
+def charuco_runtime_diagnostics() -> Dict[str, Any]:
+    has_aruco = hasattr(cv2, "aruco")
+    has_charuco_board = bool(has_aruco and hasattr(cv2.aruco, "CharucoBoard"))
+    has_charuco_detector = bool(has_aruco and hasattr(cv2.aruco, "CharucoDetector"))
+    has_interpolate = bool(has_aruco and hasattr(cv2.aruco, "interpolateCornersCharuco"))
+    has_calibrate_charuco = bool(has_aruco and hasattr(cv2.aruco, "calibrateCameraCharuco"))
+    has_calibrate_camera = hasattr(cv2, "calibrateCamera")
+    has_match_image_points = False
+    board_init_error: Optional[str] = None
+
+    if has_charuco_board and has_aruco:
+        try:
+            dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+            board = cv2.aruco.CharucoBoard((7, 5), 0.02, 0.015, dictionary)
+            has_match_image_points = hasattr(board, "matchImagePoints")
+        except Exception as e:
+            board_init_error = f"{type(e).__name__}: {e}"
+
+    legacy_supported = bool(has_charuco_board and has_interpolate and has_calibrate_charuco)
+    modern_supported = bool(has_charuco_board and has_charuco_detector and has_match_image_points and has_calibrate_camera)
+    supported = bool(legacy_supported or modern_supported)
+
+    return {
+        "opencv_version": str(getattr(cv2, "__version__", "unknown")),
+        "has_aruco": has_aruco,
+        "has_charuco_board": has_charuco_board,
+        "has_charuco_detector": has_charuco_detector,
+        "has_interpolateCornersCharuco": has_interpolate,
+        "has_calibrateCameraCharuco": has_calibrate_charuco,
+        "has_calibrateCamera": has_calibrate_camera,
+        "has_matchImagePoints": has_match_image_points,
+        "legacy_charuco_api": legacy_supported,
+        "modern_charuco_api": modern_supported,
+        "supported": supported,
+        "board_init_error": board_init_error,
+    }
+
+
 def has_charuco_support() -> bool:
-    return bool(
-        hasattr(cv2, "aruco")
-        and hasattr(cv2.aruco, "CharucoBoard")
-        and hasattr(cv2.aruco, "interpolateCornersCharuco")
-        and hasattr(cv2.aruco, "calibrateCameraCharuco")
-    )
+    return bool(charuco_runtime_diagnostics().get("supported", False))
 
 
 @dataclass
@@ -135,8 +171,21 @@ class IntrinsicsCalibrationService:
         corners, ids, _rej = cv2.aruco.detectMarkers(gray, dictionary)
         if ids is None or len(ids) < 4:
             return False, "not enough aruco markers"
-        n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
-        if n is None or int(n) < 6 or ch_corners is None or ch_ids is None:
+
+        ch_corners = None
+        ch_ids = None
+        n = 0
+        if hasattr(cv2.aruco, "interpolateCornersCharuco"):
+            n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
+            n = int(n or 0)
+        elif hasattr(cv2.aruco, "CharucoDetector"):
+            detector = cv2.aruco.CharucoDetector(board)
+            detected = detector.detectBoard(gray)
+            if isinstance(detected, tuple) and len(detected) >= 2:
+                ch_corners, ch_ids = detected[0], detected[1]
+                n = int(len(ch_ids) if ch_ids is not None else 0)
+
+        if n < 6 or ch_corners is None or ch_ids is None:
             return False, "not enough charuco corners"
         s.charuco_corners.append(ch_corners)
         s.charuco_ids.append(ch_ids)
@@ -202,15 +251,45 @@ class IntrinsicsCalibrationService:
                 float(s.charuco_marker_length_m),
                 dictionary,
             )
-            rms, k, dist, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
-                s.charuco_corners,
-                s.charuco_ids,
-                board,
-                s.image_size,
-                None,
-                None,
-            )
-            mean_err = float(rms)
+            if hasattr(cv2.aruco, "calibrateCameraCharuco"):
+                rms, k, dist, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
+                    s.charuco_corners,
+                    s.charuco_ids,
+                    board,
+                    s.image_size,
+                    None,
+                    None,
+                )
+                mean_err = float(rms)
+            else:
+                obj_points: List[np.ndarray] = []
+                img_points: List[np.ndarray] = []
+                for ch_corners, ch_ids in zip(s.charuco_corners, s.charuco_ids):
+                    if ch_corners is None or ch_ids is None:
+                        continue
+                    obj_pts, img_pts = board.matchImagePoints(ch_corners, ch_ids)
+                    if obj_pts is None or img_pts is None:
+                        continue
+                    obj_arr = np.asarray(obj_pts, dtype=np.float32).reshape(-1, 3)
+                    img_arr = np.asarray(img_pts, dtype=np.float32).reshape(-1, 2)
+                    if obj_arr.shape[0] < 6 or img_arr.shape[0] < 6:
+                        continue
+                    obj_points.append(obj_arr)
+                    img_points.append(img_arr)
+
+                if len(obj_points) < int(s.min_frames):
+                    raise RuntimeError(
+                        f"not enough valid charuco correspondences ({len(obj_points)} < {s.min_frames})"
+                    )
+
+                rms, k, dist, rvecs, tvecs = cv2.calibrateCamera(
+                    obj_points,
+                    img_points,
+                    s.image_size,
+                    None,
+                    None,
+                )
+                mean_err = mean_reprojection_error(obj_points, img_points, rvecs, tvecs, k, dist)
             board_desc = {
                 "type": "charuco",
                 "squares_x": int(s.charuco_squares_x),

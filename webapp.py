@@ -33,7 +33,11 @@ try:
     from .turntable import Turntable, TurntableConfig
     from .calibration_models import CalibrationData
     from .calibration_store import CalibrationStore
-    from .calibration_intrinsics import IntrinsicsCalibrationService, GuidedCharucoWorkflowService
+    from .calibration_intrinsics import (
+        IntrinsicsCalibrationService,
+        GuidedCharucoWorkflowService,
+        charuco_runtime_diagnostics,
+    )
     from .calibration_laser import LaserPlaneCalibrationService
 except ImportError:
     from scan_runner import ScanController, ScanConfig
@@ -52,7 +56,11 @@ except ImportError:
     from turntable import Turntable, TurntableConfig
     from calibration_models import CalibrationData
     from calibration_store import CalibrationStore
-    from calibration_intrinsics import IntrinsicsCalibrationService, GuidedCharucoWorkflowService
+    from calibration_intrinsics import (
+        IntrinsicsCalibrationService,
+        GuidedCharucoWorkflowService,
+        charuco_runtime_diagnostics,
+    )
     from calibration_laser import LaserPlaneCalibrationService
 
 log = logging.getLogger(__name__)
@@ -508,11 +516,35 @@ function renderManualCharucoStatus(payload){
   }
 }
 
+let manualCharucoPollTimer = null;
+
+function stopManualCharucoPolling(){
+  if(manualCharucoPollTimer){
+    clearInterval(manualCharucoPollTimer);
+    manualCharucoPollTimer = null;
+  }
+}
+
+function startManualCharucoPolling(){
+  if(manualCharucoPollTimer) return;
+  manualCharucoPollTimer = setInterval(() => {
+    if(document.hidden) return;
+    refreshManualCharucoStatus();
+  }, 2500);
+}
+
 async function refreshManualCharucoStatus(){
   try{
     const r = await fetch('/api/calibration/intrinsics/charuco-manual/status');
     const j = await r.json();
     renderManualCharucoStatus(j);
+    const status = j?.status || j || {};
+    const running = Boolean(status.running);
+    if(running){
+      startManualCharucoPolling();
+    }else{
+      stopManualCharucoPolling();
+    }
   }catch(e){
     q('charuco_step_feedback').textContent = 'Could not refresh guided status. Please retry.';
     q('charuco_step_feedback').style.background = '#fee2e2';
@@ -528,6 +560,7 @@ async function startManualCharucoWorkflow(){
   if(stepsInput) stepsInput.value = String(safeSteps);
   const j = await post(`/api/calibration/intrinsics/charuco-manual/start?total_steps=${encodeURIComponent(safeSteps)}`);
   renderManualCharucoStatus(j);
+  startManualCharucoPolling();
   return j;
 }
 
@@ -557,7 +590,14 @@ refreshManualCharucoStatus();
 setInterval(refreshScanStatus, 1000);
 setInterval(refreshDetectorDiag, 1000);
 setInterval(readCameraState, 2000);
-setInterval(refreshManualCharucoStatus, 1000);
+
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden){
+    stopManualCharucoPolling();
+    return;
+  }
+  refreshManualCharucoStatus();
+});
 </script>
 </body>
 </html>
@@ -1136,9 +1176,16 @@ def api_calibration_intrinsics_charuco_manual_start(
     charuco_marker_length_m: float = 0.015,
     aruco_dict_name: str = "DICT_4X4_50",
 ):
+    diag = charuco_runtime_diagnostics()
     try:
         safe_total_steps = max(5, min(int(total_steps), 60))
-        log.info("guided charuco start requested (total_steps=%s)", safe_total_steps)
+        log.info(
+            "guided charuco start requested (total_steps=%s, min_frames=%s, dict=%s, diag=%s)",
+            safe_total_steps,
+            int(min_frames),
+            str(aruco_dict_name),
+            diag,
+        )
         status = guided_charuco.start(
             total_steps=safe_total_steps,
             min_frames_required=int(min_frames),
@@ -1154,9 +1201,28 @@ def api_calibration_intrinsics_charuco_manual_start(
             "step_text": str(status.get("step_text", "Step 0 of 0")),
             "last_step_ok": bool(status.get("last_step_ok", False)),
             "last_step_message": str(status.get("last_step_message", "Workflow started.")),
+            "charuco_runtime": diag,
         }
     except Exception as e:
-        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+        error_text = f"{type(e).__name__}: {e}"
+        hint = (
+            "OpenCV aruco is present but Charuco calibration APIs are incomplete for this build. "
+            "Install opencv-contrib build with charuco support or use a build exposing CharucoDetector+matchImagePoints/calibrateCamera."
+        )
+        if bool(diag.get("supported", False)):
+            hint = "Could not start guided Charuco session. Verify board parameters and retry."
+        log.exception("guided charuco start failed: %s (diag=%s)", error_text, diag)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": error_text,
+                "error_code": "guided_charuco_start_failed",
+                "message": "Unable to start guided ChArUco calibration.",
+                "hint": hint,
+                "charuco_runtime": diag,
+            },
+            status_code=400,
+        )
 
 
 @app.get("/api/calibration/intrinsics/charuco-manual/status")
