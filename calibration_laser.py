@@ -65,6 +65,8 @@ class LaserCaptureSample:
     laser: int
     plane: List[float]
     points_px: List[List[float]]
+    confidence: float = 0.0
+    telemetry: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -140,6 +142,8 @@ class LaserPlaneCalibrationService:
             return {"ok": False, "accepted": False, "reason": "camera frame missing"}
 
         pts, _mask = detector.detect(ambient, laser_frame, object_mask=None)
+        det = detector.detect_details(ambient, laser_frame, object_mask=None, mode="calibration")
+        pts = det.points
         if not pts:
             return {"ok": True, "accepted": False, "reason": "no stripe points"}
 
@@ -160,6 +164,8 @@ class LaserPlaneCalibrationService:
                 laser=which,
                 plane=plane.tolist(),
                 points_px=uv_good.astype(np.float32).tolist(),
+                confidence=float(det.confidence),
+                telemetry=dict(det.telemetry),
             )
         )
         s.captures += 1
@@ -168,6 +174,8 @@ class LaserPlaneCalibrationService:
             "accepted": True,
             "laser": which,
             "points": int(uv_good.shape[0]),
+            "confidence": float(det.confidence),
+            "telemetry": dict(det.telemetry),
             "captures": int(s.captures),
         }
 

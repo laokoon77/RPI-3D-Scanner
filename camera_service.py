@@ -199,6 +199,12 @@ class CameraService:
         except Exception:
             log.exception("set_controls failed: %s", controls)
 
+    def apply_locked_controls(self, controls: Dict[str, Any], settle_s: float = 0.05, drop_n: int = 1) -> None:
+        self.set_controls(dict(controls))
+        _ = self.grab_fresh_frame(settle_s=max(0.0, float(settle_s)))
+        for _i in range(max(0, int(drop_n))):
+            _ = self.grab_fresh_frame(settle_s=0.0)
+
     def get_camera_controls(self) -> Dict[str, Any]:
         if self._mock:
             return dict(self._mock_controls)
@@ -280,3 +286,31 @@ class CameraService:
             time.sleep(0.005)
 
         return self.get_latest_frame()
+
+    def grab_stabilized_frame(
+        self,
+        settle_s: float = 0.05,
+        retries: int = 2,
+        min_luma_delta: float = 0.0,
+    ) -> Optional[np.ndarray]:
+        tries = max(1, int(retries) + 1)
+        prev: Optional[np.ndarray] = None
+        best: Optional[np.ndarray] = None
+
+        for _i in range(tries):
+            frame = self.grab_fresh_frame(settle_s=settle_s)
+            if frame is None:
+                continue
+            best = frame
+            if prev is None or float(min_luma_delta) <= 0.0:
+                prev = frame
+                continue
+
+            g0 = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
+            g1 = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            delta = float(np.mean(np.abs(g1.astype(np.float32) - g0.astype(np.float32))))
+            if delta <= float(min_luma_delta):
+                return frame
+            prev = frame
+
+        return best
