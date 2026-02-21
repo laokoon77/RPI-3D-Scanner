@@ -100,8 +100,37 @@ def _get_aruco_dictionary(dict_name: str):
     return cv2.aruco.getPredefinedDictionary(dict_id)
 
 
+def _make_lenient_detector_params():
+    """Build lenient ArucoDetector parameters for real-world camera images."""
+    a = cv2.aruco
+    if not hasattr(a, "DetectorParameters"):
+        return None
+    p = a.DetectorParameters()
+    try:
+        # Accept smaller markers (default 0.03 is too strict at moderate distances)
+        p.minMarkerPerimeterRate = 0.01
+        p.maxMarkerPerimeterRate = 10.0
+        # Larger adaptive threshold window range handles varying lighting
+        p.adaptiveThreshWinSizeMin = 3
+        p.adaptiveThreshWinSizeMax = 53
+        p.adaptiveThreshWinSizeStep = 10
+        # Relax corner quality requirements
+        p.minCornerDistanceRate = 0.01
+        p.minOtsuStdDev = 3.0
+        # Sub-pixel corner refinement
+        p.cornerRefinementMethod = 1  # CORNER_REFINE_SUBPIX
+        p.cornerRefinementWinSize = 5
+        p.cornerRefinementMaxIterations = 30
+        p.cornerRefinementMinAccuracy = 0.01
+    except Exception:
+        pass
+    return p
+
+
 def _detect_aruco_markers(gray: np.ndarray, dictionary):
     a = cv2.aruco
+    lenient = _make_lenient_detector_params()
+
     variants = [gray]
     try:
         variants.append(cv2.equalizeHist(gray))
@@ -117,9 +146,9 @@ def _detect_aruco_markers(gray: np.ndarray, dictionary):
         if hasattr(a, "detectMarkers"):
             corners, ids, rej = a.detectMarkers(img, dictionary)
         elif hasattr(a, "ArucoDetector"):
-            params = a.DetectorParameters() if hasattr(a, "DetectorParameters") else None
-            det = a.ArucoDetector(dictionary, params) if params is not None else a.ArucoDetector(dictionary)
-            corners, ids, rej = det.detectMarkers(img)
+            # Try lenient first, then default params
+            det_lenient = a.ArucoDetector(dictionary, lenient) if lenient is not None else a.ArucoDetector(dictionary)
+            corners, ids, rej = det_lenient.detectMarkers(img)
         else:
             raise RuntimeError("OpenCV aruco marker detector not available")
 
@@ -131,6 +160,78 @@ def _detect_aruco_markers(gray: np.ndarray, dictionary):
             return corners, ids, rej
     corners, ids, rej = best
     return corners, ids, rej
+
+
+def _charuco_detect_board(gray: np.ndarray, board) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Try CharucoDetector.detectBoard with lenient params, then legacy interpolateCornersCharuco."""
+    a = cv2.aruco
+    ch_corners: Optional[np.ndarray] = None
+    ch_ids: Optional[np.ndarray] = None
+
+    # Primary: new API CharucoDetector with lenient params (OpenCV 4.7+)
+    if hasattr(a, "CharucoDetector"):
+        for img_variant in [gray, cv2.equalizeHist(gray) if gray is not None else gray]:
+            try:
+                det_params = _make_lenient_detector_params()
+                # Try to set CharucoParameters.minMarkers = 0 if available
+                charuco_params = None
+                if hasattr(a, "CharucoParameters"):
+                    try:
+                        charuco_params = a.CharucoParameters()
+                        charuco_params.minMarkers = 0  # accept corner with any # of surrounding markers
+                        try:
+                            charuco_params.tryRefineMarkers = True
+                        except Exception:
+                            pass
+                    except Exception:
+                        charuco_params = None
+
+                if charuco_params is not None and det_params is not None:
+                    det = a.CharucoDetector(board, charuco_params, det_params)
+                elif det_params is not None:
+                    det = a.CharucoDetector(board, a.CharucoParameters() if hasattr(a, "CharucoParameters") else None, det_params) if hasattr(a, "CharucoParameters") else a.CharucoDetector(board)
+                else:
+                    det = a.CharucoDetector(board)
+
+                result = det.detectBoard(img_variant)
+                if result is not None:
+                    if len(result) == 4:
+                        cc, ci, _mc, _mi = result
+                    elif len(result) == 2:
+                        cc, ci = result
+                    else:
+                        cc, ci = None, None
+                    n = 0 if ci is None else int(len(ci))
+                    cur = 0 if ch_ids is None else int(len(ch_ids))
+                    if n > cur:
+                        ch_corners, ch_ids = cc, ci
+                    if n >= 4:
+                        return ch_corners, ch_ids
+            except Exception:
+                pass
+
+    # Fallback: legacy interpolateCornersCharuco
+    if hasattr(a, "interpolateCornersCharuco"):
+        try:
+            # We need marker corners/ids for this — detect them first
+            det_params = _make_lenient_detector_params()
+            if hasattr(a, "ArucoDetector"):
+                det = a.ArucoDetector(board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50), det_params) if det_params is not None else a.ArucoDetector(board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
+                mc, mi, _ = det.detectMarkers(gray)
+            elif hasattr(a, "detectMarkers"):
+                mc, mi, _ = a.detectMarkers(gray, board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
+            else:
+                mc, mi = None, None
+            if mi is not None and len(mi) >= 1:
+                n, cc, ci = a.interpolateCornersCharuco(mc, mi, gray, board)
+                if n is not None and int(n) > 0 and cc is not None and ci is not None:
+                    cur = 0 if ch_ids is None else int(len(ch_ids))
+                    if int(len(ci)) > cur:
+                        ch_corners, ch_ids = cc, ci
+        except Exception:
+            pass
+
+    return ch_corners, ch_ids
 
 
 def _frame_diagnostics(gray: np.ndarray) -> Dict[str, Any]:
@@ -254,23 +355,39 @@ class IntrinsicsCalibrationService:
         corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
         marker_count = 0 if ids is None else int(len(ids))
         log.info("charuco.capture.markers dict=%s marker_count=%d", s.aruco_dict_name, marker_count)
-        if ids is None or len(ids) < 2:
-            log.warning("charuco.capture.reject reason=not_enough_aruco_markers marker_count=%d", marker_count)
-            return False, "not enough aruco markers"
 
-        ch_corners = None
-        ch_ids = None
-        if hasattr(cv2.aruco, "interpolateCornersCharuco"):
-            n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
-            if n is None or int(n) < 6 or ch_corners is None or ch_ids is None:
-                ch_corners, ch_ids = None, None
-        if (ch_corners is None or ch_ids is None) and hasattr(cv2.aruco, "CharucoDetector"):
-            try:
-                det = cv2.aruco.CharucoDetector(board)
-                ch_corners, ch_ids, _m_corners, _m_ids = det.detectBoard(gray)
-            except Exception:
-                ch_corners, ch_ids = None, None
+        # If primary dict finds < 2 markers, immediately try auto-tune to discover
+        # the correct ArUco dictionary (board might use DICT_5X5_50, DICT_6X6_50 etc.)
+        if marker_count < 2:
+            auto = self._auto_tune_charuco_from_frame(gray, s)
+            log.info(
+                "charuco.capture.autotune_early retuned=%s dict=%s dims=%s score=%s",
+                bool(auto.get("retuned", False)),
+                auto.get("dict_name"),
+                auto.get("dims"),
+                auto.get("score"),
+            )
+            if auto.get("retuned", False):
+                dictionary = _get_aruco_dictionary(s.aruco_dict_name)
+                board = cv2.aruco.CharucoBoard(
+                    (int(s.charuco_squares_x), int(s.charuco_squares_y)),
+                    float(s.charuco_square_length_m),
+                    float(s.charuco_marker_length_m),
+                    dictionary,
+                )
+                corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
+                marker_count = 0 if ids is None else int(len(ids))
+                log.info("charuco.capture.markers_after_autotune dict=%s marker_count=%d", s.aruco_dict_name, marker_count)
+            if marker_count < 2:
+                log.warning("charuco.capture.reject reason=not_enough_aruco_markers marker_count=%d dict=%s", marker_count, s.aruco_dict_name)
+                return False, "not enough aruco markers"
+
+        # Use the lenient CharucoDetector helper (tries CharucoDetector with lenient
+        # params, then legacy interpolateCornersCharuco, across multiple image variants)
+        ch_corners, ch_ids = _charuco_detect_board(gray, board)
+
         if ch_corners is None or ch_ids is None or len(ch_ids) < 4:
+            # Try auto-tune dictionary/dims then retry
             auto = self._auto_tune_charuco_from_frame(gray, s)
             log.info(
                 "charuco.capture.autotune retuned=%s dict=%s dims=%s score=%s",
@@ -287,20 +404,11 @@ class IntrinsicsCalibrationService:
                     float(s.charuco_marker_length_m),
                     dictionary,
                 )
-                corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
-                if ids is not None and len(ids) >= 2:
-                    ch_corners = None
-                    ch_ids = None
-                    if hasattr(cv2.aruco, "interpolateCornersCharuco"):
-                        n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
-                        if n is None or int(n) < 4 or ch_corners is None or ch_ids is None:
-                            ch_corners, ch_ids = None, None
-                    if (ch_corners is None or ch_ids is None) and hasattr(cv2.aruco, "CharucoDetector"):
-                        try:
-                            det = cv2.aruco.CharucoDetector(board)
-                            ch_corners, ch_ids, _m_corners, _m_ids = det.detectBoard(gray)
-                        except Exception:
-                            ch_corners, ch_ids = None, None
+                ch2, ci2 = _charuco_detect_board(gray, board)
+                n2 = 0 if ci2 is None else int(len(ci2))
+                cur = 0 if ch_ids is None else int(len(ch_ids))
+                if n2 > cur:
+                    ch_corners, ch_ids = ch2, ci2
 
         if ch_corners is None or ch_ids is None or len(ch_ids) < 4:
             corner_count = 0 if ch_ids is None else int(len(ch_ids))
