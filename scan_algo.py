@@ -31,12 +31,12 @@ class StripeParams:
     threshold: Optional[int] = None
     blur_ksize: int = 3
     morph_ksize: int = 3
-    window_half_width_px: int = 25
-    min_rows: int = 24
-    max_row_jump_px: float = 28.0
-    max_gap_rows: int = 8
+    window_half_width_px: int = 30
+    min_rows: int = 14
+    max_row_jump_px: float = 40.0
+    max_gap_rows: int = 14
     adaptive_floor: int = 10
-    adaptive_scale: float = 0.45
+    adaptive_scale: float = 0.40
 
 
 class StripeDetector:
@@ -64,6 +64,7 @@ class StripeDetector:
             roi_bottom_frac=0.98,
             roi_left_frac=0.02,
             roi_right_frac=0.98,
+            channel_mode="r_weighted_magenta",
         )
         cal_prof = DetectionProfile(
             name="calibration",
@@ -81,6 +82,7 @@ class StripeDetector:
             roi_bottom_frac=1.0,
             roi_left_frac=0.0,
             roi_right_frac=1.0,
+            channel_mode="r_weighted_magenta",
         )
         self._core.set_profile(self._scan_profile_name, scan_prof)
         self._core.set_profile(self._cal_profile_name, cal_prof)
@@ -173,6 +175,17 @@ def _capture_with_retry(
     return last
 
 
+@dataclass
+class PairCaptureResult:
+    ambient: Optional[np.ndarray]
+    laser_frame: Optional[np.ndarray]
+    ambient_meta: Optional[Dict[str, Any]] = None
+    laser_meta: Optional[Dict[str, Any]] = None
+    stable: bool = True
+    drift: Optional[Dict[str, Any]] = None
+    attempts: int = 1
+
+
 def capture_pair(
     camera: CameraService,
     gpio,
@@ -182,24 +195,85 @@ def capture_pair(
     off_controls: Optional[Dict[str, Any]] = None,
     on_controls: Optional[Dict[str, Any]] = None,
     retry_n: int = 1,
+    max_pair_retries: int = 2,
+    max_exposure_drift_rel: float = 0.25,
+    max_gain_drift_rel: float = 0.25,
 ):
-    if off_controls:
-        camera.set_controls(off_controls)
-    laser_set(gpio, laser, False)
-    ambient = _capture_with_retry(camera, settle_s=settle_s, retries=retry_n)
-    _drop_frames(camera, drop_n)
+    out = capture_pair_details(
+        camera,
+        gpio,
+        laser,
+        settle_s=settle_s,
+        drop_n=drop_n,
+        off_controls=off_controls,
+        on_controls=on_controls,
+        retry_n=retry_n,
+        max_pair_retries=max_pair_retries,
+        max_exposure_drift_rel=max_exposure_drift_rel,
+        max_gain_drift_rel=max_gain_drift_rel,
+    )
+    return out.ambient, out.laser_frame
 
-    if on_controls:
-        camera.set_controls(on_controls)
-    laser_set(gpio, laser, True)
-    laser_frame = _capture_with_retry(camera, settle_s=settle_s, retries=retry_n)
-    _drop_frames(camera, drop_n)
-    laser_set(gpio, laser, False)
 
-    if off_controls:
-        camera.set_controls(off_controls)
+def capture_pair_details(
+    camera: CameraService,
+    gpio,
+    laser,
+    settle_s: float = 0.06,
+    drop_n: int = 2,
+    off_controls: Optional[Dict[str, Any]] = None,
+    on_controls: Optional[Dict[str, Any]] = None,
+    retry_n: int = 1,
+    max_pair_retries: int = 2,
+    max_exposure_drift_rel: float = 0.25,
+    max_gain_drift_rel: float = 0.25,
+) -> PairCaptureResult:
+    attempts = 0
+    best = PairCaptureResult(ambient=None, laser_frame=None, stable=True, attempts=0)
 
-    return ambient, laser_frame
+    for _i in range(max(1, int(max_pair_retries) + 1)):
+        attempts += 1
+        if off_controls:
+            camera.set_controls(off_controls)
+        laser_set(gpio, laser, False)
+        ambient = _capture_with_retry(camera, settle_s=settle_s, retries=retry_n)
+        ambient_meta = camera.get_latest_metadata() if hasattr(camera, "get_latest_metadata") else None
+        _drop_frames(camera, drop_n)
+
+        if on_controls:
+            camera.set_controls(on_controls)
+        laser_set(gpio, laser, True)
+        laser_frame = _capture_with_retry(camera, settle_s=settle_s, retries=retry_n)
+        laser_meta = camera.get_latest_metadata() if hasattr(camera, "get_latest_metadata") else None
+        _drop_frames(camera, drop_n)
+        laser_set(gpio, laser, False)
+
+        if off_controls:
+            camera.set_controls(off_controls)
+
+        stable = True
+        drift: Dict[str, Any] = {}
+        if hasattr(camera, "pair_metadata_stable"):
+            stable, drift = camera.pair_metadata_stable(
+                ambient_meta,
+                laser_meta,
+                max_exposure_drift_rel=float(max_exposure_drift_rel),
+                max_gain_drift_rel=float(max_gain_drift_rel),
+            )
+
+        best = PairCaptureResult(
+            ambient=ambient,
+            laser_frame=laser_frame,
+            ambient_meta=ambient_meta,
+            laser_meta=laser_meta,
+            stable=bool(stable),
+            drift=dict(drift),
+            attempts=attempts,
+        )
+        if ambient is not None and laser_frame is not None and bool(stable):
+            return best
+
+    return best
 
 
 def capture_triplet(camera: CameraService, gpio, laser1, laser2, settle_s: float = 0.06, drop_n: int = 2):

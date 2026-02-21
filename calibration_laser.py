@@ -7,10 +7,10 @@ import numpy as np
 
 try:
     from .calibration_models import LaserPlaneCalibration
-    from .scan_algo import capture_pair
+    from .scan_algo import capture_pair_details
 except ImportError:
     from calibration_models import LaserPlaneCalibration
-    from scan_algo import capture_pair
+    from scan_algo import capture_pair_details
 
 
 def plane_fit_svd(points_xyz: np.ndarray) -> Tuple[np.ndarray, Dict[str, float]]:
@@ -137,7 +137,16 @@ class LaserPlaneCalibrationService:
         if plane.shape[0] != 4:
             raise ValueError("board_plane must have 4 values")
 
-        ambient, laser_frame = capture_pair(camera, gpio, laser, settle_s=settle_s, drop_n=drop_n)
+        pair = capture_pair_details(
+            camera,
+            gpio,
+            laser,
+            settle_s=settle_s,
+            drop_n=drop_n,
+            retry_n=2,
+            max_pair_retries=2,
+        )
+        ambient, laser_frame = pair.ambient, pair.laser_frame
         if ambient is None or laser_frame is None:
             return {"ok": False, "accepted": False, "reason": "camera frame missing"}
 
@@ -176,6 +185,11 @@ class LaserPlaneCalibrationService:
             "points": int(uv_good.shape[0]),
             "confidence": float(det.confidence),
             "telemetry": dict(det.telemetry),
+            "pair": {
+                "stable": bool(pair.stable),
+                "attempts": int(pair.attempts),
+                "drift": dict(pair.drift or {}),
+            },
             "captures": int(s.captures),
         }
 

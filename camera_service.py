@@ -178,6 +178,54 @@ class CameraService:
         with self._lock:
             return None if self._latest_meta is None else dict(self._latest_meta)
 
+    @staticmethod
+    def _meta_float(meta: Optional[Dict[str, Any]], key: str) -> Optional[float]:
+        if not meta:
+            return None
+        v = meta.get(key)
+        if isinstance(v, (tuple, list)):
+            if not v:
+                return None
+            v = v[0]
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    def pair_metadata_stable(
+        self,
+        off_meta: Optional[Dict[str, Any]],
+        on_meta: Optional[Dict[str, Any]],
+        *,
+        max_exposure_drift_rel: float = 0.25,
+        max_gain_drift_rel: float = 0.25,
+    ) -> tuple[bool, Dict[str, Any]]:
+        off_exp = self._meta_float(off_meta, "ExposureTime")
+        on_exp = self._meta_float(on_meta, "ExposureTime")
+        off_gain = self._meta_float(off_meta, "AnalogueGain")
+        on_gain = self._meta_float(on_meta, "AnalogueGain")
+
+        exp_drift = 0.0
+        gain_drift = 0.0
+        if off_exp is not None and on_exp is not None and abs(off_exp) > 1e-6:
+            exp_drift = abs(on_exp - off_exp) / abs(off_exp)
+        if off_gain is not None and on_gain is not None and abs(off_gain) > 1e-6:
+            gain_drift = abs(on_gain - off_gain) / abs(off_gain)
+
+        stable = bool(exp_drift <= float(max_exposure_drift_rel) and gain_drift <= float(max_gain_drift_rel))
+        details: Dict[str, Any] = {
+            "off_exposure": off_exp,
+            "on_exposure": on_exp,
+            "off_gain": off_gain,
+            "on_gain": on_gain,
+            "exposure_drift_rel": float(exp_drift),
+            "gain_drift_rel": float(gain_drift),
+            "max_exposure_drift_rel": float(max_exposure_drift_rel),
+            "max_gain_drift_rel": float(max_gain_drift_rel),
+            "stable": bool(stable),
+        }
+        return stable, details
+
     def get_latest_timestamp(self) -> float:
         with self._lock:
             return self._latest_ts

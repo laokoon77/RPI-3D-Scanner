@@ -11,12 +11,12 @@ import cv2
 import numpy as np
 
 try:
-    from .scan_algo import capture_pair
+    from .scan_algo import capture_pair_details
     from .turntable import Turntable
     from .background import BackgroundModel
     from .scan_algo import StripeDetector
 except ImportError:
-    from scan_algo import capture_pair
+    from scan_algo import capture_pair_details
     from turntable import Turntable
     from background import BackgroundModel
     from scan_algo import StripeDetector
@@ -235,28 +235,32 @@ class ScanController:
                     # 2) LASER1 pair (laser profile)
                     if laser_controls:
                         self.camera.apply_locked_controls(laser_controls, settle_s=max(0.02, cfg.capture_settle_s), drop_n=1)
-                    a1, l1 = capture_pair(
+                    p1 = capture_pair_details(
                         self.camera, self.gpio, self.laser1,
                         settle_s=cfg.capture_settle_s,
                         drop_n=cfg.drop_n,
                         off_controls=normal_controls,
                         on_controls=laser_controls,
                         retry_n=2,
+                        max_pair_retries=2,
                     )
+                    a1, l1 = p1.ambient, p1.laser_frame
                     if a1 is None or l1 is None:
                         raise RuntimeError("camera returned None (laser1 pair)")
                     det1 = self.detector.detect_details(a1, l1, object_mask=obj_mask, mode="scan")
                     pts1 = det1.points if det1.confidence >= float(cfg.min_detection_confidence) else []
 
                     # 3) LASER2 pair
-                    a2, l2 = capture_pair(
+                    p2 = capture_pair_details(
                         self.camera, self.gpio, self.laser2,
                         settle_s=cfg.capture_settle_s,
                         drop_n=cfg.drop_n,
                         off_controls=normal_controls,
                         on_controls=laser_controls,
                         retry_n=2,
+                        max_pair_retries=2,
                     )
+                    a2, l2 = p2.ambient, p2.laser_frame
                     if a2 is None or l2 is None:
                         raise RuntimeError("camera returned None (laser2 pair)")
                     det2 = self.detector.detect_details(a2, l2, object_mask=obj_mask, mode="scan")
@@ -269,6 +273,16 @@ class ScanController:
                         "laser2": dict(det2.telemetry),
                         "laser1_confidence": float(det1.confidence),
                         "laser2_confidence": float(det2.confidence),
+                        "laser1_pair": {
+                            "stable": bool(p1.stable),
+                            "attempts": int(p1.attempts),
+                            "drift": dict(p1.drift or {}),
+                        },
+                        "laser2_pair": {
+                            "stable": bool(p2.stable),
+                            "attempts": int(p2.attempts),
+                            "drift": dict(p2.drift or {}),
+                        },
                         "accepted_laser1": bool(det1.confidence >= float(cfg.min_detection_confidence)),
                         "accepted_laser2": bool(det2.confidence >= float(cfg.min_detection_confidence)),
                         "min_detection_confidence": float(cfg.min_detection_confidence),

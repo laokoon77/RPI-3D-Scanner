@@ -27,7 +27,7 @@ class DetectionProfile:
     roi_bottom_frac: float = 1.0
     roi_left_frac: float = 0.0
     roi_right_frac: float = 1.0
-    channel_mode: str = "r_minus_gb"
+    channel_mode: str = "r_weighted_magenta"
 
 
 @dataclass
@@ -73,36 +73,38 @@ def default_detection_profiles() -> Dict[str, DetectionProfile]:
         "scan": DetectionProfile(
             name="scan",
             adaptive_floor=10,
-            adaptive_scale=0.45,
-            blur_ksize=3,
-            morph_open_ksize=3,
-            morph_close_ksize=3,
-            min_component_area=10,
-            min_rows=24,
-            max_row_jump_px=28.0,
-            max_gap_rows=8,
-            window_half_width_px=25,
-            roi_top_frac=0.02,
-            roi_bottom_frac=0.98,
-            roi_left_frac=0.02,
-            roi_right_frac=0.98,
-        ),
-        "calibration": DetectionProfile(
-            name="calibration",
-            adaptive_floor=8,
-            adaptive_scale=0.35,
+            adaptive_scale=0.40,
             blur_ksize=3,
             morph_open_ksize=3,
             morph_close_ksize=3,
             min_component_area=6,
-            min_rows=18,
-            max_row_jump_px=36.0,
-            max_gap_rows=12,
+            min_rows=14,
+            max_row_jump_px=40.0,
+            max_gap_rows=14,
+            window_half_width_px=30,
+            roi_top_frac=0.02,
+            roi_bottom_frac=0.98,
+            roi_left_frac=0.02,
+            roi_right_frac=0.98,
+            channel_mode="r_weighted_magenta",
+        ),
+        "calibration": DetectionProfile(
+            name="calibration",
+            adaptive_floor=8,
+            adaptive_scale=0.30,
+            blur_ksize=3,
+            morph_open_ksize=3,
+            morph_close_ksize=3,
+            min_component_area=4,
+            min_rows=12,
+            max_row_jump_px=48.0,
+            max_gap_rows=18,
             window_half_width_px=32,
             roi_top_frac=0.0,
             roi_bottom_frac=1.0,
             roi_left_frac=0.0,
             roi_right_frac=1.0,
+            channel_mode="r_weighted_magenta",
         ),
     }
 
@@ -124,14 +126,24 @@ class LaserDetectorCore:
         off_i = off_rgb.astype(np.int16)
         on_i = on_rgb.astype(np.int16)
         diff = on_i - off_i
+        r = diff[:, :, 0]
+        g = diff[:, :, 1]
+        b = diff[:, :, 2]
 
         mode = str(profile.channel_mode)
         if mode == "r_minus_max_gb":
-            score = diff[:, :, 0] - np.maximum(diff[:, :, 1], diff[:, :, 2])
+            score = r - np.maximum(g, b)
         elif mode == "r_only":
-            score = diff[:, :, 0]
+            score = r
+        elif mode == "magenta_minus_g":
+            score = ((r + b) // 2) - g
+        elif mode == "r_weighted_magenta":
+            red_lift = r - ((g + b) // 2)
+            magenta_lift = ((r + b) // 2) - g
+            red_only_scaled = (r * 11) // 20
+            score = np.maximum.reduce([red_lift, magenta_lift, red_only_scaled])
         else:
-            score = diff[:, :, 0] - ((diff[:, :, 1] + diff[:, :, 2]) // 2)
+            score = r - ((g + b) // 2)
 
         return np.clip(score, 0, 255).astype(np.uint8)
 
@@ -182,15 +194,23 @@ class LaserDetectorCore:
 
         kept_mask = np.zeros_like(mask)
         num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        components_total = max(0, int(num_labels) - 1)
         kept_components = 0
+        rejected_area_small = 0
+        rejected_area_large = 0
+        rejected_height = 0
+        mask_pixels_raw = int(np.count_nonzero(mask))
         for label in range(1, int(num_labels)):
             area = int(stats[label, cv2.CC_STAT_AREA])
             h = int(stats[label, cv2.CC_STAT_HEIGHT])
             if area < int(profile.min_component_area):
+                rejected_area_small += 1
                 continue
             if area > int(profile.max_component_area):
+                rejected_area_large += 1
                 continue
             if h < int(profile.min_component_height):
+                rejected_height += 1
                 continue
             kept_mask[labels == label] = 255
             kept_components += 1
@@ -199,6 +219,8 @@ class LaserDetectorCore:
         points: List[Tuple[float, int]] = []
         prev_x: Optional[float] = None
         continuity_hits = 0
+        rejected_jump_rows = 0
+        gap_resets = 0
         gap_rows = 0
         considered_rows = 0
 
@@ -227,6 +249,11 @@ class LaserDetectorCore:
 
             if prev_x is not None:
                 if abs(x_sub - prev_x) > float(profile.max_row_jump_px):
+                    rejected_jump_rows += 1
+                    gap_rows += 1
+                    if gap_rows > int(profile.max_gap_rows):
+                        prev_x = None
+                        gap_resets += 1
                     continue
                 continuity_hits += 1
 
@@ -235,6 +262,10 @@ class LaserDetectorCore:
             gap_rows = 0
 
         mean_score = float(score[kept_mask > 0].mean()) if int(np.count_nonzero(kept_mask)) > 0 else 0.0
+        positive = score[score > 0]
+        p50 = float(np.percentile(positive, 50)) if positive.size else 0.0
+        p90 = float(np.percentile(positive, 90)) if positive.size else 0.0
+        p99 = float(np.percentile(positive, 99)) if positive.size else 0.0
         rows_factor = min(1.0, float(len(points)) / max(1.0, float(profile.min_rows)))
         continuity_factor = float(continuity_hits) / max(1.0, float(len(points) - 1)) if len(points) > 1 else 0.0
         strength_factor = float(np.clip((mean_score - float(threshold)) / max(1.0, float(threshold)), 0.0, 1.0))
@@ -243,14 +274,27 @@ class LaserDetectorCore:
 
         telemetry = {
             "profile": asdict(profile),
+            "channel_mode": str(profile.channel_mode),
+            "threshold_source": "fixed" if profile.threshold is not None else "adaptive",
             "threshold": int(threshold),
             "rows_total": int(h),
             "rows_considered": int(considered_rows),
             "rows_kept": int(len(points)),
             "continuity_hits": int(continuity_hits),
+            "rejected_jump_rows": int(rejected_jump_rows),
+            "gap_resets": int(gap_resets),
+            "components_total": int(components_total),
             "kept_components": int(kept_components),
+            "rejected_components_area_small": int(rejected_area_small),
+            "rejected_components_area_large": int(rejected_area_large),
+            "rejected_components_height": int(rejected_height),
+            "mask_pixels_raw": int(mask_pixels_raw),
             "mask_pixels": int(np.count_nonzero(kept_mask)),
             "mean_score": float(mean_score),
+            "score_p50": float(p50),
+            "score_p90": float(p90),
+            "score_p99": float(p99),
+            "positive_pixels": int(positive.size),
             "confidence": float(confidence),
         }
 
