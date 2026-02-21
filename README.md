@@ -34,6 +34,42 @@ Notes for Raspberry Pi:
 
 ## 2) Start the scanner web server
 
+### 2.1 One-command launcher (recommended)
+
+From project root, run:
+
+```bash
+python start_scanner.py
+```
+
+Launcher script: [`start_scanner.py`](start_scanner.py)
+
+Defaults:
+
+- host: `0.0.0.0`
+- port: `8000`
+
+Optional environment overrides:
+
+- `SCANNER_HOST` (example: `127.0.0.1`)
+- `SCANNER_PORT` (example: `9000`)
+- `SCANNER_MOCK_HW` (optional, enables hardwareless mode when set to `1/true/yes/on`)
+- `SCANNER_ENABLE_LEGACY_BACKGROUND_PATH` (optional, enables legacy background flow when set to `1/true/yes/on`)
+
+Windows `cmd.exe` example with overrides:
+
+```bash
+set SCANNER_MOCK_HW=1 && set SCANNER_ENABLE_LEGACY_BACKGROUND_PATH=0 && set SCANNER_HOST=127.0.0.1 && set SCANNER_PORT=8000 && python start_scanner.py
+```
+
+Linux/macOS example with overrides:
+
+```bash
+SCANNER_MOCK_HW=1 SCANNER_ENABLE_LEGACY_BACKGROUND_PATH=0 SCANNER_HOST=127.0.0.1 SCANNER_PORT=8000 python start_scanner.py
+```
+
+### 2.2 Existing startup commands (still supported)
+
 Use the CLI entry in [`cli.py`](cli.py):
 
 ```bash
