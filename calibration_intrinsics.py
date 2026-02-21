@@ -221,12 +221,14 @@ class IntrinsicsCalibrationService:
             }
 
         rms_f = float(rms)
+        rms_ok = bool(rms_f <= 1.2)
+        mean_ok = bool(float(mean_err) <= 1.0)
         quality = {
-            "ok": bool(s.frames_used >= s.min_frames and np.isfinite(rms_f)),
+            "ok": bool(s.frames_used >= s.min_frames and np.isfinite(rms_f) and rms_ok and mean_ok),
             "rms_threshold": 1.2,
-            "rms_ok": bool(rms_f <= 1.2),
+            "rms_ok": rms_ok,
             "mean_error_threshold_px": 1.0,
-            "mean_error_ok": bool(float(mean_err) <= 1.0),
+            "mean_error_ok": mean_ok,
             "min_frames_required": int(s.min_frames),
         }
 
@@ -244,4 +246,201 @@ class IntrinsicsCalibrationService:
         )
         self.last_result = result
         return result
+
+
+GUIDED_CHARUCO_INSTRUCTION = "Move board to a new pose manually, then capture."
+
+
+@dataclass
+class GuidedCharucoSession:
+    total_steps: int = 40
+    current_step: int = 1
+    min_frames_required: int = 20
+    running: bool = False
+    solved: bool = False
+    calibration_ok: bool = False
+    captures_attempted: int = 0
+    accepted_frames: int = 0
+    last_detection_result: str = "session not started"
+    instruction: str = GUIDED_CHARUCO_INSTRUCTION
+    quality_summary: Dict[str, Any] = field(default_factory=dict)
+
+
+class GuidedCharucoWorkflowService:
+    def __init__(self, intrinsics_service: IntrinsicsCalibrationService):
+        self._intrinsics = intrinsics_service
+        self.session: Optional[GuidedCharucoSession] = None
+        self.last_intrinsics: Optional[IntrinsicsCalibration] = None
+
+    def start(
+        self,
+        *,
+        total_steps: int = 40,
+        min_frames_required: int = 20,
+        charuco_squares_x: int = 7,
+        charuco_squares_y: int = 5,
+        charuco_square_length_m: float = 0.02,
+        charuco_marker_length_m: float = 0.015,
+        aruco_dict_name: str = "DICT_4X4_50",
+    ) -> Dict[str, Any]:
+        steps = max(1, int(total_steps))
+        min_frames = max(1, int(min_frames_required))
+        self._intrinsics.start(
+            board_type="charuco",
+            min_frames=min_frames,
+            charuco_squares_x=int(charuco_squares_x),
+            charuco_squares_y=int(charuco_squares_y),
+            charuco_square_length_m=float(charuco_square_length_m),
+            charuco_marker_length_m=float(charuco_marker_length_m),
+            aruco_dict_name=str(aruco_dict_name),
+        )
+        self.session = GuidedCharucoSession(
+            total_steps=steps,
+            current_step=1,
+            min_frames_required=min_frames,
+            running=True,
+            solved=False,
+            calibration_ok=False,
+            captures_attempted=0,
+            accepted_frames=0,
+            last_detection_result="session started",
+            instruction=GUIDED_CHARUCO_INSTRUCTION,
+            quality_summary={},
+        )
+        self.last_intrinsics = None
+        return self.status()
+
+    def status(self) -> Dict[str, Any]:
+        s = self.session
+        if s is None:
+            return {
+                "running": False,
+                "has_result": self.last_intrinsics is not None,
+                "instruction": GUIDED_CHARUCO_INSTRUCTION,
+            }
+        return {
+            "running": bool(s.running),
+            "solved": bool(s.solved),
+            "calibration_ok": bool(s.calibration_ok),
+            "current_step": int(s.current_step),
+            "total_steps": int(s.total_steps),
+            "captures_attempted": int(s.captures_attempted),
+            "accepted_frames": int(s.accepted_frames),
+            "min_frames_required": int(s.min_frames_required),
+            "last_detection_result": str(s.last_detection_result),
+            "instruction": str(s.instruction),
+            "quality_summary": dict(s.quality_summary),
+            "has_result": self.last_intrinsics is not None,
+        }
+
+    def capture_step(self, rgb: np.ndarray) -> Dict[str, Any]:
+        s = self.session
+        if s is None or not s.running:
+            raise RuntimeError("guided charuco workflow not running")
+        if s.solved:
+            return {
+                "ok": True,
+                "step_capture": False,
+                "reason": "already solved",
+                "status": self.status(),
+            }
+        if s.captures_attempted >= s.total_steps:
+            return {
+                "ok": False,
+                "step_capture": False,
+                "reason": "all steps already captured",
+                "status": self.status(),
+            }
+
+        capture = self._intrinsics.capture(rgb)
+        accepted = bool(capture.get("accepted", False))
+        reason = str(capture.get("reason", ""))
+        s.captures_attempted += 1
+        s.accepted_frames = int(capture.get("frames_used", s.accepted_frames))
+        s.last_detection_result = reason
+
+        if s.captures_attempted < s.total_steps:
+            s.current_step = s.captures_attempted + 1
+            return {
+                "ok": True,
+                "step_capture": True,
+                "accepted": accepted,
+                "reason": reason,
+                "status": self.status(),
+            }
+
+        s.current_step = s.total_steps
+        solved_payload = self.solve_final()
+        solved_payload.update(
+            {
+                "step_capture": True,
+                "accepted": accepted,
+                "reason": reason,
+            }
+        )
+        return solved_payload
+
+    def solve_final(self) -> Dict[str, Any]:
+        s = self.session
+        if s is None:
+            raise RuntimeError("guided charuco workflow not started")
+        if s.solved and self.last_intrinsics is not None:
+            return {
+                "ok": True,
+                "solved": True,
+                "intrinsics": self.last_intrinsics,
+                "status": self.status(),
+            }
+
+        try:
+            result = self._intrinsics.solve()
+            quality = dict(result.quality or {})
+            min_ok = bool(int(result.frames_used) >= int(s.min_frames_required))
+            rms_ok = bool(quality.get("rms_ok", False))
+            mean_ok = bool(quality.get("mean_error_ok", False))
+            calibration_ok = bool(min_ok and rms_ok and mean_ok)
+            quality_summary = {
+                "ok": calibration_ok,
+                "frames_used": int(result.frames_used),
+                "captures_attempted": int(s.captures_attempted),
+                "min_frames_required": int(s.min_frames_required),
+                "rms_reprojection_error": float(result.rms_reprojection_error),
+                "rms_threshold": float(quality.get("rms_threshold", 1.2)),
+                "rms_ok": rms_ok,
+                "mean_reprojection_error": float(result.mean_reprojection_error),
+                "mean_error_threshold_px": float(quality.get("mean_error_threshold_px", 1.0)),
+                "mean_error_ok": mean_ok,
+            }
+            s.quality_summary = quality_summary
+            s.calibration_ok = calibration_ok
+            s.running = False
+            s.solved = True
+            self.last_intrinsics = result
+            return {
+                "ok": True,
+                "solved": True,
+                "calibration_ok": calibration_ok,
+                "quality": quality_summary,
+                "intrinsics": result,
+                "status": self.status(),
+            }
+        except Exception as e:
+            s.running = False
+            s.solved = True
+            s.calibration_ok = False
+            s.quality_summary = {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "frames_used": int(s.accepted_frames),
+                "captures_attempted": int(s.captures_attempted),
+                "min_frames_required": int(s.min_frames_required),
+            }
+            return {
+                "ok": False,
+                "solved": False,
+                "calibration_ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "quality": dict(s.quality_summary),
+                "status": self.status(),
+            }
 

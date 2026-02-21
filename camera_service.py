@@ -32,6 +32,7 @@ class CameraSettings:
     size: Tuple[int, int] = (1280, 720)
     fps: Optional[float] = 25.0
     jpeg_quality: int = 80
+    rotation_degrees: int = 180
     hflip: bool = False
     vflip: bool = False
     mock: bool = False
@@ -82,6 +83,18 @@ class CameraService:
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _apply_frame_transform(self, frame: np.ndarray) -> np.ndarray:
+        deg = int(self.settings.rotation_degrees) % 360
+        if deg == 0:
+            return frame
+        if deg == 90:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if deg == 180:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if deg == 270:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        raise ValueError(f"Unsupported camera rotation_degrees={self.settings.rotation_degrees}; expected one of 0,90,180,270")
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -139,6 +152,7 @@ class CameraService:
         while not self._stop.is_set():
             t0 = time.time()
             frame, meta = self._generate_mock_frame(t0)
+            frame = self._apply_frame_transform(frame)
             with self._lock:
                 self._latest_frame = frame
                 self._latest_meta = meta
@@ -157,6 +171,7 @@ class CameraService:
             t0 = time.time()
             try:
                 frame = self._picam.capture_array()
+                frame = self._apply_frame_transform(frame)
                 meta = self._picam.capture_metadata()
                 with self._lock:
                     self._latest_frame = frame
@@ -315,6 +330,7 @@ class CameraService:
                 time.sleep(settle_s)
             t0 = time.time()
             frame, meta = self._generate_mock_frame(t0)
+            frame = self._apply_frame_transform(frame)
             with self._lock:
                 self._latest_frame = frame
                 self._latest_meta = meta
