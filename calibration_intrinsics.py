@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-log = logging.getLogger(__name__)
-
 try:
     from .calibration_models import IntrinsicsCalibration
 except ImportError:
     from calibration_models import IntrinsicsCalibration
+
+
+log = logging.getLogger(__name__)
 
 
 def checkerboard_object_points(cols: int, rows: int, square_size: float) -> np.ndarray:
@@ -47,46 +48,112 @@ def mean_reprojection_error(
     return err_sum / float(n)
 
 
+def has_charuco_support() -> bool:
+    if not hasattr(cv2, "aruco"):
+        return False
+    a = cv2.aruco
+    has_board = hasattr(a, "CharucoBoard")
+    has_detect = hasattr(a, "detectMarkers") or hasattr(a, "ArucoDetector")
+    has_charuco_detect = hasattr(a, "interpolateCornersCharuco") or hasattr(a, "CharucoDetector")
+    has_charuco_solve = hasattr(a, "calibrateCameraCharuco") or hasattr(cv2, "calibrateCamera")
+    return bool(has_board and has_detect and has_charuco_detect and has_charuco_solve)
+
+
 def charuco_runtime_diagnostics() -> Dict[str, Any]:
-    has_aruco = hasattr(cv2, "aruco")
-    has_charuco_board = bool(has_aruco and hasattr(cv2.aruco, "CharucoBoard"))
-    has_charuco_detector = bool(has_aruco and hasattr(cv2.aruco, "CharucoDetector"))
-    has_interpolate = bool(has_aruco and hasattr(cv2.aruco, "interpolateCornersCharuco"))
-    has_calibrate_charuco = bool(has_aruco and hasattr(cv2.aruco, "calibrateCameraCharuco"))
-    has_calibrate_camera = hasattr(cv2, "calibrateCamera")
-    has_match_image_points = False
-    board_init_error: Optional[str] = None
-
-    if has_charuco_board and has_aruco:
-        try:
-            dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-            board = cv2.aruco.CharucoBoard((7, 5), 0.02, 0.015, dictionary)
-            has_match_image_points = hasattr(board, "matchImagePoints")
-        except Exception as e:
-            board_init_error = f"{type(e).__name__}: {e}"
-
-    legacy_supported = bool(has_charuco_board and has_interpolate and has_calibrate_charuco)
-    modern_supported = bool(has_charuco_board and has_charuco_detector and has_match_image_points and has_calibrate_camera)
-    supported = bool(legacy_supported or modern_supported)
-
+    a = getattr(cv2, "aruco", None)
     return {
         "opencv_version": str(getattr(cv2, "__version__", "unknown")),
-        "has_aruco": has_aruco,
-        "has_charuco_board": has_charuco_board,
-        "has_charuco_detector": has_charuco_detector,
-        "has_interpolateCornersCharuco": has_interpolate,
-        "has_calibrateCameraCharuco": has_calibrate_charuco,
-        "has_calibrateCamera": has_calibrate_camera,
-        "has_matchImagePoints": has_match_image_points,
-        "legacy_charuco_api": legacy_supported,
-        "modern_charuco_api": modern_supported,
-        "supported": supported,
-        "board_init_error": board_init_error,
+        "has_aruco": bool(a is not None),
+        "has_charuco_board": bool(a is not None and hasattr(a, "CharucoBoard")),
+        "has_detectMarkers": bool(a is not None and hasattr(a, "detectMarkers")),
+        "has_ArucoDetector": bool(a is not None and hasattr(a, "ArucoDetector")),
+        "has_interpolateCornersCharuco": bool(a is not None and hasattr(a, "interpolateCornersCharuco")),
+        "has_CharucoDetector": bool(a is not None and hasattr(a, "CharucoDetector")),
+        "has_calibrateCameraCharuco": bool(a is not None and hasattr(a, "calibrateCameraCharuco")),
     }
 
 
-def has_charuco_support() -> bool:
-    return bool(charuco_runtime_diagnostics().get("supported", False))
+_CANDIDATE_ARUCO_DICTS = [
+    "DICT_4X4_50",
+    "DICT_4X4_100",
+    "DICT_5X5_50",
+    "DICT_5X5_100",
+    "DICT_6X6_50",
+    "DICT_6X6_100",
+    "DICT_7X7_50",
+    "DICT_7X7_100",
+]
+
+_CANDIDATE_CHARUCO_DIMS = [
+    (8, 8),
+    (7, 5),
+    (5, 7),
+    (8, 6),
+    (6, 8),
+    (11, 8),
+    (8, 11),
+]
+
+
+def _get_aruco_dictionary(dict_name: str):
+    dict_id = getattr(cv2.aruco, dict_name, cv2.aruco.DICT_4X4_50)
+    return cv2.aruco.getPredefinedDictionary(dict_id)
+
+
+def _detect_aruco_markers(gray: np.ndarray, dictionary):
+    a = cv2.aruco
+    variants = [gray]
+    try:
+        variants.append(cv2.equalizeHist(gray))
+    except Exception:
+        pass
+    try:
+        variants.append(cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5))
+    except Exception:
+        pass
+
+    best = ([], None, [])
+    for img in variants:
+        if hasattr(a, "detectMarkers"):
+            corners, ids, rej = a.detectMarkers(img, dictionary)
+        elif hasattr(a, "ArucoDetector"):
+            params = a.DetectorParameters() if hasattr(a, "DetectorParameters") else None
+            det = a.ArucoDetector(dictionary, params) if params is not None else a.ArucoDetector(dictionary)
+            corners, ids, rej = det.detectMarkers(img)
+        else:
+            raise RuntimeError("OpenCV aruco marker detector not available")
+
+        n = 0 if ids is None else int(len(ids))
+        b = 0 if best[1] is None else int(len(best[1]))
+        if n > b:
+            best = (corners, ids, rej)
+        if n >= 6:
+            return corners, ids, rej
+    corners, ids, rej = best
+    return corners, ids, rej
+
+
+def _frame_diagnostics(gray: np.ndarray) -> Dict[str, Any]:
+    lap_var = 0.0
+    try:
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        lap_var = 0.0
+    try:
+        p10, p50, p90 = np.percentile(gray, [10, 50, 90])
+    except Exception:
+        p10, p50, p90 = 0.0, 0.0, 0.0
+    return {
+        "shape": [int(gray.shape[1]), int(gray.shape[0])],
+        "mean": float(np.mean(gray)),
+        "std": float(np.std(gray)),
+        "min": int(np.min(gray)),
+        "max": int(np.max(gray)),
+        "p10": float(p10),
+        "p50": float(p50),
+        "p90": float(p90),
+        "laplacian_var": lap_var,
+    }
 
 
 @dataclass
@@ -96,10 +163,10 @@ class IntrinsicsSession:
     checkerboard_rows: int = 6
     square_size_m: float = 0.01
     min_frames: int = 12
-    charuco_squares_x: int = 7
-    charuco_squares_y: int = 5
-    charuco_square_length_m: float = 0.02
-    charuco_marker_length_m: float = 0.015
+    charuco_squares_x: int = 8
+    charuco_squares_y: int = 8
+    charuco_square_length_m: float = 0.015
+    charuco_marker_length_m: float = 0.011
     aruco_dict_name: str = "DICT_4X4_50"
 
     frames_captured: int = 0
@@ -160,43 +227,177 @@ class IntrinsicsCalibrationService:
         if not has_charuco_support():
             return False, "charuco not available"
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        dict_id = getattr(cv2.aruco, s.aruco_dict_name, cv2.aruco.DICT_4X4_50)
-        dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
+        diag = _frame_diagnostics(gray)
+        log.info(
+            "charuco.capture.begin dict=%s dims=%sx%s square=%.6f marker=%.6f frame=%sx%s mean=%.2f std=%.2f p10=%.1f p50=%.1f p90=%.1f lap_var=%.2f",
+            s.aruco_dict_name,
+            int(s.charuco_squares_x),
+            int(s.charuco_squares_y),
+            float(s.charuco_square_length_m),
+            float(s.charuco_marker_length_m),
+            int(diag["shape"][0]),
+            int(diag["shape"][1]),
+            float(diag["mean"]),
+            float(diag["std"]),
+            float(diag["p10"]),
+            float(diag["p50"]),
+            float(diag["p90"]),
+            float(diag["laplacian_var"]),
+        )
+        dictionary = _get_aruco_dictionary(s.aruco_dict_name)
         board = cv2.aruco.CharucoBoard(
             (int(s.charuco_squares_x), int(s.charuco_squares_y)),
             float(s.charuco_square_length_m),
             float(s.charuco_marker_length_m),
             dictionary,
         )
-        if hasattr(cv2.aruco, "detectMarkers"):
-            corners, ids, _rej = cv2.aruco.detectMarkers(gray, dictionary)
-        elif hasattr(cv2.aruco, "ArucoDetector"):
-            detector = cv2.aruco.ArucoDetector(dictionary)
-            corners, ids, _rej = detector.detectMarkers(gray)
-        else:
-            return False, "aruco marker detector unavailable"
-        if ids is None or len(ids) < 4:
+        corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
+        marker_count = 0 if ids is None else int(len(ids))
+        log.info("charuco.capture.markers dict=%s marker_count=%d", s.aruco_dict_name, marker_count)
+        if ids is None or len(ids) < 2:
+            log.warning("charuco.capture.reject reason=not_enough_aruco_markers marker_count=%d", marker_count)
             return False, "not enough aruco markers"
 
         ch_corners = None
         ch_ids = None
-        n = 0
         if hasattr(cv2.aruco, "interpolateCornersCharuco"):
             n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
-            n = int(n or 0)
-        elif hasattr(cv2.aruco, "CharucoDetector"):
-            detector = cv2.aruco.CharucoDetector(board)
-            detected = detector.detectBoard(gray)
-            if isinstance(detected, tuple) and len(detected) >= 2:
-                ch_corners, ch_ids = detected[0], detected[1]
-                n = int(len(ch_ids) if ch_ids is not None else 0)
+            if n is None or int(n) < 6 or ch_corners is None or ch_ids is None:
+                ch_corners, ch_ids = None, None
+        if (ch_corners is None or ch_ids is None) and hasattr(cv2.aruco, "CharucoDetector"):
+            try:
+                det = cv2.aruco.CharucoDetector(board)
+                ch_corners, ch_ids, _m_corners, _m_ids = det.detectBoard(gray)
+            except Exception:
+                ch_corners, ch_ids = None, None
+        if ch_corners is None or ch_ids is None or len(ch_ids) < 4:
+            auto = self._auto_tune_charuco_from_frame(gray, s)
+            log.info(
+                "charuco.capture.autotune retuned=%s dict=%s dims=%s score=%s",
+                bool(auto.get("retuned", False)),
+                auto.get("dict_name"),
+                auto.get("dims"),
+                auto.get("score"),
+            )
+            if auto.get("retuned", False):
+                dictionary = _get_aruco_dictionary(s.aruco_dict_name)
+                board = cv2.aruco.CharucoBoard(
+                    (int(s.charuco_squares_x), int(s.charuco_squares_y)),
+                    float(s.charuco_square_length_m),
+                    float(s.charuco_marker_length_m),
+                    dictionary,
+                )
+                corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
+                if ids is not None and len(ids) >= 2:
+                    ch_corners = None
+                    ch_ids = None
+                    if hasattr(cv2.aruco, "interpolateCornersCharuco"):
+                        n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
+                        if n is None or int(n) < 4 or ch_corners is None or ch_ids is None:
+                            ch_corners, ch_ids = None, None
+                    if (ch_corners is None or ch_ids is None) and hasattr(cv2.aruco, "CharucoDetector"):
+                        try:
+                            det = cv2.aruco.CharucoDetector(board)
+                            ch_corners, ch_ids, _m_corners, _m_ids = det.detectBoard(gray)
+                        except Exception:
+                            ch_corners, ch_ids = None, None
 
-        if n < 6 or ch_corners is None or ch_ids is None:
+        if ch_corners is None or ch_ids is None or len(ch_ids) < 4:
+            corner_count = 0 if ch_ids is None else int(len(ch_ids))
+            log.warning(
+                "charuco.capture.reject reason=not_enough_charuco_corners dict=%s dims=%sx%s marker_count=%d corner_count=%d",
+                s.aruco_dict_name,
+                int(s.charuco_squares_x),
+                int(s.charuco_squares_y),
+                marker_count,
+                corner_count,
+            )
             return False, "not enough charuco corners"
+
         s.charuco_corners.append(ch_corners)
         s.charuco_ids.append(ch_ids)
         s.frames_used += 1
+        log.info(
+            "charuco.capture.accepted dict=%s dims=%sx%s marker_count=%d corner_count=%d frames_used=%d",
+            s.aruco_dict_name,
+            int(s.charuco_squares_x),
+            int(s.charuco_squares_y),
+            marker_count,
+            int(len(ch_ids)),
+            int(s.frames_used),
+        )
         return True, "charuco captured"
+
+    def _auto_tune_charuco_from_frame(self, gray: np.ndarray, s: IntrinsicsSession) -> Dict[str, Any]:
+        best = {
+            "score": -1,
+            "dict_name": s.aruco_dict_name,
+            "dims": (int(s.charuco_squares_x), int(s.charuco_squares_y)),
+        }
+
+        dicts = [s.aruco_dict_name] + [d for d in _CANDIDATE_ARUCO_DICTS if d != s.aruco_dict_name]
+        dims_list = [(int(s.charuco_squares_x), int(s.charuco_squares_y))] + [d for d in _CANDIDATE_CHARUCO_DIMS if d != (int(s.charuco_squares_x), int(s.charuco_squares_y))]
+
+        for dn in dicts:
+            try:
+                dictionary = _get_aruco_dictionary(dn)
+                corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
+            except Exception:
+                continue
+            if ids is None or len(ids) < 2:
+                continue
+
+            marker_count = int(len(ids))
+            for dx, dy in dims_list:
+                try:
+                    board = cv2.aruco.CharucoBoard(
+                        (int(dx), int(dy)),
+                        float(s.charuco_square_length_m),
+                        float(s.charuco_marker_length_m),
+                        dictionary,
+                    )
+                    corner_count = 0
+                    if hasattr(cv2.aruco, "interpolateCornersCharuco"):
+                        n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
+                        if n is not None and ch_corners is not None and ch_ids is not None:
+                            corner_count = int(len(ch_ids))
+                    if corner_count < 1 and hasattr(cv2.aruco, "CharucoDetector"):
+                        try:
+                            det = cv2.aruco.CharucoDetector(board)
+                            ch_corners, ch_ids, _mc, _mi = det.detectBoard(gray)
+                            if ch_ids is not None:
+                                corner_count = int(len(ch_ids))
+                        except Exception:
+                            pass
+                    score = corner_count * 100 + marker_count
+                    if score > int(best["score"]):
+                        best = {"score": score, "dict_name": dn, "dims": (int(dx), int(dy))}
+                except Exception:
+                    continue
+
+        retuned = False
+        if int(best["score"]) > 0:
+            new_dict = str(best["dict_name"])
+            new_dims = best["dims"]
+            if new_dict != s.aruco_dict_name or tuple(new_dims) != (int(s.charuco_squares_x), int(s.charuco_squares_y)):
+                s.aruco_dict_name = new_dict
+                s.charuco_squares_x = int(new_dims[0])
+                s.charuco_squares_y = int(new_dims[1])
+                retuned = True
+        log.info(
+            "charuco.autotune.result score=%d dict=%s dims=%sx%s retuned=%s",
+            int(best["score"]),
+            str(s.aruco_dict_name),
+            int(s.charuco_squares_x),
+            int(s.charuco_squares_y),
+            bool(retuned),
+        )
+        return {
+            "retuned": retuned,
+            "dict_name": s.aruco_dict_name,
+            "dims": [int(s.charuco_squares_x), int(s.charuco_squares_y)],
+            "score": int(best["score"]),
+        }
 
     def capture(self, rgb: np.ndarray) -> Dict[str, Any]:
         if self.session is None:
@@ -249,8 +450,7 @@ class IntrinsicsCalibrationService:
                 "square_size_m": float(s.square_size_m),
             }
         else:
-            dict_id = getattr(cv2.aruco, s.aruco_dict_name, cv2.aruco.DICT_4X4_50)
-            dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
+            dictionary = _get_aruco_dictionary(s.aruco_dict_name)
             board = cv2.aruco.CharucoBoard(
                 (int(s.charuco_squares_x), int(s.charuco_squares_y)),
                 float(s.charuco_square_length_m),
@@ -266,36 +466,31 @@ class IntrinsicsCalibrationService:
                     None,
                     None,
                 )
-                mean_err = float(rms)
             else:
-                obj_points: List[np.ndarray] = []
-                img_points: List[np.ndarray] = []
-                for ch_corners, ch_ids in zip(s.charuco_corners, s.charuco_ids):
-                    if ch_corners is None or ch_ids is None:
+                obj_pts: List[np.ndarray] = []
+                img_pts: List[np.ndarray] = []
+                for cc, ci in zip(s.charuco_corners, s.charuco_ids):
+                    if cc is None or ci is None:
                         continue
-                    obj_pts, img_pts = board.matchImagePoints(ch_corners, ch_ids)
-                    if obj_pts is None or img_pts is None:
-                        continue
-                    obj_arr = np.asarray(obj_pts, dtype=np.float32).reshape(-1, 3)
-                    img_arr = np.asarray(img_pts, dtype=np.float32).reshape(-1, 2)
-                    if obj_arr.shape[0] < 6 or img_arr.shape[0] < 6:
-                        continue
-                    obj_points.append(obj_arr)
-                    img_points.append(img_arr)
-
-                if len(obj_points) < int(s.min_frames):
-                    raise RuntimeError(
-                        f"not enough valid charuco correspondences ({len(obj_points)} < {s.min_frames})"
-                    )
-
+                    if hasattr(board, "matchImagePoints"):
+                        op, ip = board.matchImagePoints(cc, ci)
+                        if op is None or ip is None:
+                            continue
+                        op = np.asarray(op, dtype=np.float32).reshape(-1, 3)
+                        ip = np.asarray(ip, dtype=np.float32).reshape(-1, 2)
+                        if len(op) >= 6 and len(ip) >= 6:
+                            obj_pts.append(op)
+                            img_pts.append(ip)
+                if not obj_pts:
+                    raise RuntimeError("charuco solve fallback could not build matched points")
                 rms, k, dist, rvecs, tvecs = cv2.calibrateCamera(
-                    obj_points,
-                    img_points,
+                    obj_pts,
+                    img_pts,
                     s.image_size,
                     None,
                     None,
                 )
-                mean_err = mean_reprojection_error(obj_points, img_points, rvecs, tvecs, k, dist)
+            mean_err = float(rms)
             board_desc = {
                 "type": "charuco",
                 "squares_x": int(s.charuco_squares_x),
@@ -364,10 +559,10 @@ class GuidedCharucoWorkflowService:
         *,
         total_steps: int = 10,
         min_frames_required: int = 20,
-        charuco_squares_x: int = 7,
-        charuco_squares_y: int = 5,
-        charuco_square_length_m: float = 0.02,
-        charuco_marker_length_m: float = 0.015,
+        charuco_squares_x: int = 8,
+        charuco_squares_y: int = 8,
+        charuco_square_length_m: float = 0.015,
+        charuco_marker_length_m: float = 0.011,
         aruco_dict_name: str = "DICT_4X4_50",
     ) -> Dict[str, Any]:
         steps = max(1, int(total_steps))
@@ -420,45 +615,6 @@ class GuidedCharucoWorkflowService:
             return "Step not accepted. Camera frame was unavailable. Please retry."
         return "Step not accepted. Move the board, keep it fully visible, and try again."
 
-    @staticmethod
-    def _capture_reason_details(reason: str) -> Tuple[str, str, str]:
-        reason_l = str(reason).strip().lower()
-        if "aruco marker detector unavailable" in reason_l:
-            return (
-                "aruco_detector_unavailable",
-                "Could not detect board markers in this OpenCV build.",
-                "Install an OpenCV build with ArUco marker detection support, then retry guided capture.",
-            )
-        if "charuco not available" in reason_l:
-            return (
-                "charuco_runtime_unavailable",
-                "ChArUco detection is unavailable in this environment.",
-                "Install OpenCV contrib with ChArUco support, then retry guided capture.",
-            )
-        if "not enough aruco markers" in reason_l:
-            return (
-                "not_enough_aruco_markers",
-                "Board was not detected clearly enough.",
-                "Keep the whole board in view, improve lighting, and move a little closer.",
-            )
-        if "not enough charuco corners" in reason_l:
-            return (
-                "not_enough_charuco_corners",
-                "Board corners were too incomplete for this step.",
-                "Keep the board flat in frame with sharper focus and less blur, then retry.",
-            )
-        if "empty frame" in reason_l:
-            return (
-                "empty_frame",
-                "Camera frame was unavailable for this capture.",
-                "Wait a moment and press Capture Step again.",
-            )
-        return (
-            "capture_not_accepted",
-            "Step was not accepted.",
-            "Move the board to a different angle, keep it fully visible, and retry.",
-        )
-
     def status(self) -> Dict[str, Any]:
         s = self.session
         if s is None:
@@ -500,52 +656,34 @@ class GuidedCharucoWorkflowService:
                 "ok": True,
                 "step_capture": False,
                 "reason": "already solved",
-                "reason_code": "already_solved",
-                "message": "Calibration is already finished.",
-                "hint": "Use Start Guided Workflow to begin a new capture session.",
                 "status": self.status(),
             }
-        if s.captures_attempted >= s.total_steps:
+        if s.accepted_frames >= s.total_steps:
             s.last_step_ok = False
             s.last_step_message = "All steps are already captured. Press Finish & Check."
             return {
                 "ok": False,
                 "step_capture": False,
                 "reason": "all steps already captured",
-                "reason_code": "all_steps_already_captured",
-                "message": "All capture steps are already used.",
-                "hint": "Press Finish & Check to solve calibration, or restart guided workflow.",
                 "status": self.status(),
             }
 
         capture = self._intrinsics.capture(rgb)
         accepted = bool(capture.get("accepted", False))
         reason = str(capture.get("reason", ""))
-        reason_code, message, hint = self._capture_reason_details(reason)
         s.captures_attempted += 1
         s.accepted_frames = int(capture.get("frames_used", s.accepted_frames))
         s.last_detection_result = reason
         s.last_step_ok = bool(accepted)
         s.last_step_message = self._friendly_step_message(accepted, reason)
 
-        if s.captures_attempted < s.total_steps:
-            s.current_step = s.captures_attempted + 1
+        if s.accepted_frames < s.total_steps:
+            s.current_step = min(s.total_steps, s.accepted_frames + 1)
             return {
                 "ok": True,
                 "step_capture": True,
                 "accepted": accepted,
                 "reason": reason,
-                "reason_code": "step_accepted" if accepted else reason_code,
-                "message": (
-                    "Step accepted."
-                    if accepted
-                    else message
-                ),
-                "hint": (
-                    "Move the board to a new angle and capture the next step."
-                    if accepted
-                    else hint
-                ),
                 "status": self.status(),
             }
 
@@ -556,17 +694,6 @@ class GuidedCharucoWorkflowService:
                 "step_capture": True,
                 "accepted": accepted,
                 "reason": reason,
-                "reason_code": "step_accepted" if accepted else reason_code,
-                "message": (
-                    "Final step captured."
-                    if accepted
-                    else message
-                ),
-                "hint": (
-                    "Finishing calibration now."
-                    if accepted
-                    else hint
-                ),
             }
         )
         return solved_payload
