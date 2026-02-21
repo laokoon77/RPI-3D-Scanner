@@ -10,7 +10,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi import Response
 from fastapi.staticfiles import StaticFiles
@@ -28,7 +28,7 @@ try:
         laser_init,
         laser_set,
     )
-    from .scan_algo import StripeDetector, StripeParams, capture_pair, jpeg_with_text
+    from .scan_algo import StripeDetector, StripeParams, capture_pair_details, jpeg_with_text
     from .background import BackgroundModel, BackgroundParams
     from .turntable import Turntable, TurntableConfig
     from .calibration_models import CalibrationData
@@ -47,7 +47,7 @@ except ImportError:
         laser_init,
         laser_set,
     )
-    from scan_algo import StripeDetector, StripeParams, capture_pair, jpeg_with_text
+    from scan_algo import StripeDetector, StripeParams, capture_pair_details, jpeg_with_text
     from background import BackgroundModel, BackgroundParams
     from turntable import Turntable, TurntableConfig
     from calibration_models import CalibrationData
@@ -88,6 +88,64 @@ turntable = None
 
 normal_controls = None  # dict or None
 laser_controls = None   # dict or None
+camera_profiles: dict[str, dict[str, Any]] = {
+    "normal": {},
+    "laser": {},
+}
+
+
+def _normalize_controls_dict(src: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in (src or {}).items():
+        if v is None:
+            continue
+        if k == "ColourGains" and isinstance(v, (list, tuple)) and len(v) >= 2:
+            out[k] = (float(v[0]), float(v[1]))
+            continue
+        if isinstance(v, (int, float, bool, tuple, list, str)):
+            out[k] = v
+    return out
+
+
+def _sync_profile_aliases() -> None:
+    global normal_controls, laser_controls
+    normal = dict(camera_profiles.get("normal", {}) or {})
+    laser = dict(camera_profiles.get("laser", {}) or {})
+    normal_controls = normal if normal else None
+    laser_controls = laser if laser else None
+
+
+def _build_profile_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    prof: dict[str, Any] = {"AeEnable": False, "AwbEnable": False}
+    if "ExposureTime" in meta:
+        prof["ExposureTime"] = int(meta["ExposureTime"])
+    if "AnalogueGain" in meta:
+        prof["AnalogueGain"] = float(meta["AnalogueGain"])
+    if "ColourGains" in meta:
+        cg = meta["ColourGains"]
+        if isinstance(cg, (list, tuple)) and len(cg) >= 2:
+            prof["ColourGains"] = (float(cg[0]), float(cg[1]))
+    if "LensPosition" in meta:
+        prof["LensPosition"] = float(meta["LensPosition"])
+        prof["AfMode"] = 0
+    return prof
+
+
+def _camera_state_payload() -> dict[str, Any]:
+    meta = camera.get_latest_metadata() or {}
+    return {
+        "ok": True,
+        "controls": camera.get_camera_controls(),
+        "meta": meta,
+        "profiles": {
+            "normal": dict(camera_profiles.get("normal", {}) or {}),
+            "laser": dict(camera_profiles.get("laser", {}) or {}),
+        },
+        "active_profiles": {
+            "normal_set": bool(camera_profiles.get("normal")),
+            "laser_set": bool(camera_profiles.get("laser")),
+        },
+    }
 
 capture_lock = threading.Lock()
 scan_ctl = None
@@ -127,7 +185,8 @@ def startup():
     ))
 
     def _get_profiles():
-    # grabs the latest globals
+        # grabs the latest globals
+        _sync_profile_aliases()
         return normal_controls, laser_controls
 
     global scan_ctl
@@ -195,18 +254,38 @@ def index():
   <button onclick="post('/api/background/capture?n=15')">Capture legacy background (optional)</button>
   <a href="/debug/objectmask.jpg" target="_blank">Open debug object mask</a>
 
-  <h3>Camera</h3>
-  <button onclick="post('/api/camera/auto')">Auto (AE/AWB + Continuous AF)</button>
-  <button onclick="post('/api/camera/af')">Autofocus Now</button>
-  <button onclick="post('/api/camera/freeze')">Freeze From Current</button>
-  <input id="focus" type="number" step="0.1" min="0" max="10" value="1.5"/>
-  <button onclick="post('/api/camera/focus?pos='+document.getElementById('focus').value)">Manual Focus</button>
+  <h3>Camera controls</h3>
+  <div style="display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:8px;max-width:1100px">
+    <label>ExposureTime (us)<input id="cam_exposure" type="number" step="100" min="1" value="10000"/></label>
+    <label>AnalogueGain<input id="cam_gain" type="number" step="0.01" min="0" value="1.0"/></label>
+    <label>AE Enable<select id="cam_ae"><option value="1">true</option><option value="0">false</option></select></label>
+    <label>AWB Enable<select id="cam_awb"><option value="1">true</option><option value="0">false</option></select></label>
+
+    <label>ColourGain Red<input id="cam_cg_r" type="number" step="0.01" min="0" value="1.0"/></label>
+    <label>ColourGain Blue<input id="cam_cg_b" type="number" step="0.01" min="0" value="1.0"/></label>
+    <label>Brightness<input id="cam_brightness" type="number" step="0.01" value="0.0"/></label>
+    <label>Contrast<input id="cam_contrast" type="number" step="0.01" value="1.0"/></label>
+
+    <label>Saturation<input id="cam_saturation" type="number" step="0.01" value="1.0"/></label>
+    <label>Sharpness<input id="cam_sharpness" type="number" step="0.01" value="1.0"/></label>
+    <label>LensPosition<input id="cam_lens" type="number" step="0.01" min="0" max="10" value="1.5"/></label>
+    <label>Focus (legacy)<input id="focus" type="number" step="0.1" min="0" max="10" value="1.5"/></label>
+  </div>
+  <p>
+    <button onclick="readCameraState()">Read current</button>
+    <button onclick="applyCameraControls()">Apply controls</button>
+    <button onclick="post('/api/camera/auto')">Auto (AE/AWB + Continuous AF)</button>
+    <button onclick="post('/api/camera/freeze')">Freeze from current</button>
+    <button onclick="post('/api/camera/af')">Autofocus now</button>
+    <button onclick="post('/api/camera/focus?pos='+q('focus').value)">Manual focus (legacy)</button>
+  </p>
 
   <h3>Camera profiles</h3>
-  <button onclick="post('/api/camera/profile/save?name=normal')">Save NORMAL profile</button>
-  <button onclick="post('/api/camera/profile/save?name=laser')">Save LASER profile</button>
-  <button onclick="post('/api/camera/profile/apply?name=normal')">Apply NORMAL</button>
-  <button onclick="post('/api/camera/profile/apply?name=laser')">Apply LASER</button>
+  <button onclick="saveProfile('normal')">Save NORMAL profile</button>
+  <button onclick="saveProfile('laser')">Save LASER profile</button>
+  <button onclick="loadProfile('normal')">Load NORMAL</button>
+  <button onclick="loadProfile('laser')">Load LASER</button>
+  <pre id="cam_state" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap"></pre>
 
   <h3>Stepper</h3>
   <button onclick="post('/api/stepper/enable?enabled=1')">Hold ON</button>
@@ -256,6 +335,84 @@ async function startScan(){
   const speed = encodeURIComponent(q('scan_speed').value);
   const saveImages = q('scan_save_images').checked ? 1 : 0;
   await post(`/api/scan/start?step_deg=${stepDeg}&span_deg=${spanDeg}&speed=${speed}&save_images=${saveImages}`);
+}
+
+function toNum(id){
+  const v = Number(q(id).value);
+  return Number.isFinite(v) ? v : null;
+}
+
+function fillIfFinite(id, v){
+  if(typeof v === 'number' && Number.isFinite(v)) q(id).value = String(v);
+}
+
+async function readCameraState(){
+  const target = q('cam_state');
+  try{
+    const r = await fetch('/api/camera/state');
+    const j = await r.json();
+    const meta = j.meta || {};
+    const controls = j.controls || {};
+    const cg = meta.ColourGains || controls.ColourGains || [1.0, 1.0];
+
+    fillIfFinite('cam_exposure', Number(meta.ExposureTime ?? controls.ExposureTime));
+    fillIfFinite('cam_gain', Number(meta.AnalogueGain ?? controls.AnalogueGain));
+    fillIfFinite('cam_cg_r', Number(Array.isArray(cg) ? cg[0] : 1.0));
+    fillIfFinite('cam_cg_b', Number(Array.isArray(cg) ? cg[1] : 1.0));
+    fillIfFinite('cam_lens', Number(meta.LensPosition ?? controls.LensPosition));
+    fillIfFinite('focus', Number(meta.LensPosition ?? controls.LensPosition));
+    fillIfFinite('cam_brightness', Number(meta.Brightness ?? controls.Brightness));
+    fillIfFinite('cam_contrast', Number(meta.Contrast ?? controls.Contrast));
+    fillIfFinite('cam_saturation', Number(meta.Saturation ?? controls.Saturation));
+    fillIfFinite('cam_sharpness', Number(meta.Sharpness ?? controls.Sharpness));
+
+    const ae = meta.AeEnable ?? controls.AeEnable;
+    const awb = meta.AwbEnable ?? controls.AwbEnable;
+    q('cam_ae').value = (ae === false || ae === 0) ? '0' : '1';
+    q('cam_awb').value = (awb === false || awb === 0) ? '0' : '1';
+
+    target.textContent = JSON.stringify(j, null, 2);
+  }catch(e){
+    target.textContent = 'camera state fetch failed: ' + e;
+  }
+}
+
+async function applyCameraControls(){
+  const payload = {
+    ExposureTime: toNum('cam_exposure'),
+    AnalogueGain: toNum('cam_gain'),
+    AeEnable: q('cam_ae').value === '1',
+    AwbEnable: q('cam_awb').value === '1',
+    ColourGains: [toNum('cam_cg_r') ?? 1.0, toNum('cam_cg_b') ?? 1.0],
+    Brightness: toNum('cam_brightness'),
+    Contrast: toNum('cam_contrast'),
+    Saturation: toNum('cam_saturation'),
+    Sharpness: toNum('cam_sharpness'),
+    LensPosition: toNum('cam_lens'),
+  };
+  Object.keys(payload).forEach((k) => {
+    if(payload[k] === null || payload[k] === undefined) delete payload[k];
+  });
+
+  const r = await fetch('/api/camera/controls/apply', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload),
+  });
+  const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+  if(!j.ok) console.error('apply controls failed', j);
+  await readCameraState();
+  return j;
+}
+
+async function saveProfile(name){
+  await post('/api/camera/profile/save?name=' + encodeURIComponent(name));
+  await readCameraState();
+}
+
+async function loadProfile(name){
+  await post('/api/camera/profile/load?name=' + encodeURIComponent(name));
+  await readCameraState();
 }
 
 async function refreshScanStatus(){
@@ -310,8 +467,10 @@ async function loadRuns(){
 refreshScanStatus();
 refreshDetectorDiag();
 loadRuns();
+readCameraState();
 setInterval(refreshScanStatus, 1000);
 setInterval(refreshDetectorDiag, 1000);
+setInterval(readCameraState, 2000);
 </script>
 </body>
 </html>
@@ -366,7 +525,18 @@ def view_stream():
                             camera.set_controls(laser_controls)
 
                         laser_obj = laser1 if laser_sel == 1 else laser2
-                        ambient_laser, laser_frame = capture_pair(camera, gpio, laser_obj, settle_s=0.06, drop_n=2)
+                        pair = capture_pair_details(
+                            camera,
+                            gpio,
+                            laser_obj,
+                            settle_s=0.06,
+                            drop_n=2,
+                            off_controls=normal_controls,
+                            on_controls=laser_controls,
+                            retry_n=1,
+                            max_pair_retries=2,
+                        )
+                        ambient_laser, laser_frame = pair.ambient, pair.laser_frame
 
                         if ambient_laser is None or laser_frame is None:
                             jpeg = jpeg_with_text(frame, "NO CAMERA FRAME", quality=camera.settings.jpeg_quality)
@@ -378,6 +548,11 @@ def view_stream():
                                     "source": "overlay_preview",
                                     "active_laser": int(laser_sel),
                                     "confidence": float(det.confidence),
+                                    "pair": {
+                                        "stable": bool(pair.stable),
+                                        "attempts": int(pair.attempts),
+                                        "drift": dict(pair.drift or {}),
+                                    },
                                     "telemetry": dict(det.telemetry),
                                 })
                             if not det.points:
@@ -590,41 +765,75 @@ def cam_focus(pos: float):
 
 @app.get("/api/camera/controls")
 def cam_controls():
-    return {"ok": True, "controls": camera.get_camera_controls()}
+    return _camera_state_payload()
+
+
+@app.get("/api/camera/state")
+def cam_state():
+    return _camera_state_payload()
 
 @app.get("/api/camera/meta")
 def cam_meta():
     return {"ok": True, "meta": camera.get_latest_metadata() or {}}
 
 
+@app.post("/api/camera/ae")
+def cam_ae(enabled: int):
+    camera.set_controls({"AeEnable": bool(enabled)})
+    return {"ok": True, "AeEnable": bool(enabled)}
+
+
+@app.post("/api/camera/awb")
+def cam_awb(enabled: int):
+    camera.set_controls({"AwbEnable": bool(enabled)})
+    return {"ok": True, "AwbEnable": bool(enabled)}
+
+
+@app.post("/api/camera/controls/apply")
+def cam_apply_controls(payload: dict[str, Any] = Body(default_factory=dict)):
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "JSON object payload expected"}, status_code=400)
+    controls = _normalize_controls_dict(payload)
+    if not controls:
+        return JSONResponse({"ok": False, "error": "no supported controls supplied"}, status_code=400)
+    camera.set_controls(controls)
+    return {"ok": True, "applied": controls, "state": _camera_state_payload()}
+
+
+@app.get("/api/camera/profiles")
+def cam_profiles():
+    return {
+        "ok": True,
+        "profiles": {
+            "normal": dict(camera_profiles.get("normal", {}) or {}),
+            "laser": dict(camera_profiles.get("laser", {}) or {}),
+        },
+    }
+
+
 @app.post("/api/camera/profile/save")
 def cam_save_profile(name: str):
     global normal_controls, laser_controls
-    meta = camera.get_latest_metadata() or {}
-
-    # Force frozen behavior when applying this profile later
-    prof: dict[str, Any] = {"AeEnable": False, "AwbEnable": False}
-
-    if "ExposureTime" in meta:
-        prof["ExposureTime"] = int(meta["ExposureTime"])
-    if "AnalogueGain" in meta:
-        prof["AnalogueGain"] = float(meta["AnalogueGain"])
-    if "ColourGains" in meta:
-        prof["ColourGains"] = tuple(meta["ColourGains"])
-
-    # lock focus if available
-    if "LensPosition" in meta:
-        prof["LensPosition"] = float(meta["LensPosition"])
-        prof["AfMode"] = 0  # "manual" in our fallback scheme
-
-    if name == "normal":
-        normal_controls = prof
-    elif name == "laser":
-        laser_controls = prof
-    else:
+    key = str(name).strip().lower()
+    if key not in {"normal", "laser"}:
         return JSONResponse({"ok": False, "error": "name must be normal or laser"}, status_code=400)
+    meta = camera.get_latest_metadata() or {}
+    prof = _build_profile_from_meta(meta)
+    camera_profiles[key] = _normalize_controls_dict(prof)
+    _sync_profile_aliases()
+    return {"ok": True, "name": key, "profile": dict(camera_profiles[key])}
 
-    return {"ok": True, "name": name, "profile": prof}
+
+@app.post("/api/camera/profile/load")
+def cam_load_profile(name: str):
+    key = str(name).strip().lower()
+    if key not in {"normal", "laser"}:
+        return JSONResponse({"ok": False, "error": "name must be normal or laser"}, status_code=400)
+    prof = dict(camera_profiles.get(key, {}) or {})
+    if not prof:
+        return JSONResponse({"ok": False, "error": f"profile {key} not set"}, status_code=400)
+    camera.set_controls(prof)
+    return {"ok": True, "name": key, "profile": prof}
 
 
 @app.get("/api/system/mode")
@@ -675,11 +884,12 @@ def api_detector_telemetry():
 
 @app.post("/api/camera/profile/apply")
 def cam_apply_profile(name: str):
-    prof = normal_controls if name == "normal" else laser_controls if name == "laser" else None
-    if prof is None:
-        return JSONResponse({"ok": False, "error": f"profile {name} not set"}, status_code=400)
+    key = str(name).strip().lower()
+    prof = dict(camera_profiles.get(key, {}) or {})
+    if not prof:
+        return JSONResponse({"ok": False, "error": f"profile {key} not set"}, status_code=400)
     camera.set_controls(prof)
-    return {"ok": True, "name": name}
+    return {"ok": True, "name": key, "profile": prof}
 
 
 @app.post("/api/scan/start")

@@ -201,6 +201,14 @@ Detector telemetry (scan + preview diagnostics):
 curl "http://<pi-ip>:8000/api/detector/telemetry"
 ```
 
+Telemetry now includes additional tuning fields from [`LaserDetectorCore.detect()`](laser_detector_core.py:138), including:
+
+- `channel_mode`, `threshold_source`, `threshold`
+- `score_p50`, `score_p90`, `score_p99`, `positive_pixels`
+- `components_total`, `kept_components`, component rejection counters
+- `rejected_jump_rows`, `gap_resets`
+- pair drift/stability telemetry in scan/preview payloads (`exposure_drift_rel`, `gain_drift_rel`, `stable`, `attempts`)
+
 Stop scan:
 
 ```bash
@@ -239,6 +247,58 @@ python tools/export_run_to_json.py runs/<run_id>
 - or open [`viewer/index.html`](viewer/index.html) directly
 
 Viewer details: [`README_VIEWER.md`](README_VIEWER.md)
+
+---
+
+## 8) Real-time camera tuning workflow (for violet-looking laser stripes)
+
+When the red line appears violet/pink due to AWB/AE, start with manual controls and save two profiles.
+
+### 8.1 Use the new UI panel on `/`
+
+The main page now includes a real-time camera control panel with:
+
+- exposure time (`ExposureTime`)
+- analog gain (`AnalogueGain`)
+- AWB toggle + colour gains (`ColourGains`)
+- AE toggle (`AeEnable`)
+- brightness/contrast/saturation/sharpness
+- lens position (if the camera stack exposes it)
+- actions: read current, apply controls, save/load `normal` and `laser` profiles
+
+### 8.2 Recommended starting values
+
+Starting point for laser capture profile (adjust per setup):
+
+- `AeEnable=false`
+- `AwbEnable=false`
+- `ExposureTime=8000..14000` us
+- `AnalogueGain=1.0..2.5`
+- `ColourGains=(1.6, 0.8)` (slightly red-biased)
+- `Brightness=0.0`, `Contrast=1.0`, `Saturation=1.0`, `Sharpness=1.0`
+
+Then:
+
+1. tune until overlay keeps a continuous stripe,
+2. save as `laser`,
+3. capture normal lighting and save as `normal`.
+
+### 8.3 Camera control API
+
+Core endpoints added in [`webapp.py`](webapp.py):
+
+- `GET /api/camera/state`
+- `GET /api/camera/controls`
+- `GET /api/camera/meta`
+- `POST /api/camera/controls/apply` (JSON controls)
+- `POST /api/camera/ae?enabled=0|1`
+- `POST /api/camera/awb?enabled=0|1`
+- `GET /api/camera/profiles`
+- `POST /api/camera/profile/save?name=normal|laser`
+- `POST /api/camera/profile/load?name=normal|laser`
+- `POST /api/camera/profile/apply?name=normal|laser` (backward-compatible)
+
+These are safe in mock mode as well (`SCANNER_MOCK_HW=1`).
 
 ---
 
