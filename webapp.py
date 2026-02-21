@@ -310,15 +310,18 @@ def index():
   <h3>Detector diagnostics</h3>
   <pre id="detector_diag" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap"></pre>
 
-  <h3>Manual ChArUco intrinsics (40-step guided)</h3>
+  <h3>Guided Camera Calibration</h3>
+  <p style="max-width:900px">Follow the guided steps. Move the board to a new angle each time, keep the full board visible, then press <b>Capture Step</b>.</p>
   <p>
-    <button onclick="startManualCharucoWorkflow()">Start 40-step workflow</button>
-    <button onclick="captureManualCharucoStep()">Capture current step</button>
-    <button onclick="solveManualCharucoWorkflow()">Solve now</button>
+    <label for="charuco_total_steps"><b>Number of steps</b></label>
+    <input id="charuco_total_steps" type="number" min="5" max="60" step="1" value="10" style="width:90px"/>
+    <button onclick="startManualCharucoWorkflow()">Start</button>
+    <button onclick="captureManualCharucoStep()">Capture Step</button>
+    <button onclick="solveManualCharucoWorkflow()">Finish &amp; Check</button>
   </p>
-  <p id="charuco_progress" style="font-weight:bold">Progress: not started</p>
-  <p id="charuco_instruction">Instruction: Move board to a new pose manually, then capture.</p>
-  <pre id="charuco_status" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap"></pre>
+  <p id="charuco_progress" style="font-size:1.2em;font-weight:700;margin:10px 0">Step 0 of 0</p>
+  <p id="charuco_instruction">Move the board to a new angle, keep it fully visible, then press Capture Step.</p>
+  <p id="charuco_step_feedback" style="display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid #ccc;font-weight:700;background:#f3f4f6;color:#111827">Not started</p>
 
   <h3>Runs</h3>
   <button onclick="loadRuns()">Refresh runs</button>
@@ -477,19 +480,32 @@ async function loadRuns(){
 
 function renderManualCharucoStatus(payload){
   const status = payload?.status || payload || {};
-  q('charuco_status').textContent = JSON.stringify(payload, null, 2);
   const current = Number(status.current_step || 0);
-  const total = Number(status.total_steps || 40);
-  if(status.running){
-    q('charuco_progress').textContent = `Progress: ${current}/${total}`;
-  }else if(status.solved){
-    const ok = status.calibration_ok ? 'OK' : 'NOT OK';
-    const qs = status.quality_summary || {};
-    q('charuco_progress').textContent = `Progress: ${total}/${total} | Calibration ${ok} | frames=${qs.frames_used ?? 0}, rms=${qs.rms_reprojection_error ?? 'n/a'}, mean=${qs.mean_reprojection_error ?? 'n/a'}`;
+  const total = Number(status.total_steps || 0);
+  const defaultStepText = `Step ${Math.max(0, current)} of ${Math.max(0, total)}`;
+  q('charuco_progress').textContent = String(status.step_text || payload?.step_text || defaultStepText);
+  q('charuco_instruction').textContent = String(
+    status.instruction ||
+    'Move the board to a new angle, keep it fully visible, then press Capture Step.'
+  );
+
+  const feedback = q('charuco_step_feedback');
+  const msg = String(status.last_step_message || payload?.last_step_message || 'Not started');
+  const ok = Boolean(status.last_step_ok ?? payload?.last_step_ok);
+  feedback.textContent = msg;
+  if(msg.toLowerCase().includes('not started')){
+    feedback.style.background = '#f3f4f6';
+    feedback.style.color = '#111827';
+    feedback.style.borderColor = '#d1d5db';
+  }else if(ok){
+    feedback.style.background = '#dcfce7';
+    feedback.style.color = '#166534';
+    feedback.style.borderColor = '#22c55e';
   }else{
-    q('charuco_progress').textContent = 'Progress: not started';
+    feedback.style.background = '#fee2e2';
+    feedback.style.color = '#991b1b';
+    feedback.style.borderColor = '#ef4444';
   }
-  q('charuco_instruction').textContent = 'Instruction: ' + (status.instruction || 'Move board to a new pose manually, then capture.');
 }
 
 async function refreshManualCharucoStatus(){
@@ -498,12 +514,18 @@ async function refreshManualCharucoStatus(){
     const j = await r.json();
     renderManualCharucoStatus(j);
   }catch(e){
-    q('charuco_status').textContent = 'manual charuco status fetch failed: ' + e;
+    q('charuco_step_feedback').textContent = 'Could not refresh guided status. Please retry.';
+    q('charuco_step_feedback').style.background = '#fee2e2';
+    q('charuco_step_feedback').style.color = '#991b1b';
+    q('charuco_step_feedback').style.borderColor = '#ef4444';
   }
 }
 
 async function startManualCharucoWorkflow(){
-  const r = await fetch('/api/calibration/intrinsics/charuco-manual/start', {method:'POST'});
+  const rawSteps = Number(q('charuco_total_steps').value);
+  const safeSteps = Number.isFinite(rawSteps) ? Math.max(5, Math.min(60, Math.round(rawSteps))) : 10;
+  q('charuco_total_steps').value = String(safeSteps);
+  const r = await fetch(`/api/calibration/intrinsics/charuco-manual/start?total_steps=${encodeURIComponent(safeSteps)}`, {method:'POST'});
   const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
   renderManualCharucoStatus(j);
   return j;
@@ -1102,7 +1124,7 @@ def api_calibration_status():
 
 @app.post("/api/calibration/intrinsics/charuco-manual/start")
 def api_calibration_intrinsics_charuco_manual_start(
-    total_steps: int = 40,
+    total_steps: int = 10,
     min_frames: int = 20,
     charuco_squares_x: int = 7,
     charuco_squares_y: int = 5,
@@ -1111,8 +1133,9 @@ def api_calibration_intrinsics_charuco_manual_start(
     aruco_dict_name: str = "DICT_4X4_50",
 ):
     try:
+        safe_total_steps = max(5, min(int(total_steps), 60))
         status = guided_charuco.start(
-            total_steps=int(total_steps),
+            total_steps=safe_total_steps,
             min_frames_required=int(min_frames),
             charuco_squares_x=int(charuco_squares_x),
             charuco_squares_y=int(charuco_squares_y),
@@ -1120,14 +1143,27 @@ def api_calibration_intrinsics_charuco_manual_start(
             charuco_marker_length_m=float(charuco_marker_length_m),
             aruco_dict_name=str(aruco_dict_name),
         )
-        return {"ok": True, "status": status}
+        return {
+            "ok": True,
+            "status": status,
+            "step_text": str(status.get("step_text", "Step 0 of 0")),
+            "last_step_ok": bool(status.get("last_step_ok", False)),
+            "last_step_message": str(status.get("last_step_message", "Workflow started.")),
+        }
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
 
 
 @app.get("/api/calibration/intrinsics/charuco-manual/status")
 def api_calibration_intrinsics_charuco_manual_status():
-    return {"ok": True, "status": guided_charuco.status()}
+    status = guided_charuco.status()
+    return {
+        "ok": True,
+        "status": status,
+        "step_text": str(status.get("step_text", "Step 0 of 0")),
+        "last_step_ok": bool(status.get("last_step_ok", False)),
+        "last_step_message": str(status.get("last_step_message", "Workflow not started yet.")),
+    }
 
 
 @app.post("/api/calibration/intrinsics/charuco-manual/capture")
@@ -1147,6 +1183,11 @@ def api_calibration_intrinsics_charuco_manual_capture(settle_s: float = 0.05):
             payload["intrinsics"] = asdict(intrinsics_obj)
             payload["persisted"] = True
             payload["store_path"] = str(calibration_store.path)
+        status = payload.get("status") if isinstance(payload, dict) else {}
+        if isinstance(status, dict):
+            payload["step_text"] = str(status.get("step_text", "Step 0 of 0"))
+            payload["last_step_ok"] = bool(status.get("last_step_ok", False))
+            payload["last_step_message"] = str(status.get("last_step_message", "Capture complete."))
         return payload
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
@@ -1165,6 +1206,11 @@ def api_calibration_intrinsics_charuco_manual_solve():
             payload["intrinsics"] = asdict(intrinsics_obj)
             payload["persisted"] = True
             payload["store_path"] = str(calibration_store.path)
+        status = payload.get("status") if isinstance(payload, dict) else {}
+        if isinstance(status, dict):
+            payload["step_text"] = str(status.get("step_text", "Step 0 of 0"))
+            payload["last_step_ok"] = bool(status.get("last_step_ok", False))
+            payload["last_step_message"] = str(status.get("last_step_message", "Finished."))
         return payload
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)

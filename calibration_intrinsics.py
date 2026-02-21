@@ -248,12 +248,12 @@ class IntrinsicsCalibrationService:
         return result
 
 
-GUIDED_CHARUCO_INSTRUCTION = "Move board to a new pose manually, then capture."
+GUIDED_CHARUCO_INSTRUCTION = "Move the board to a new angle, keep it fully visible, then press Capture Step."
 
 
 @dataclass
 class GuidedCharucoSession:
-    total_steps: int = 40
+    total_steps: int = 10
     current_step: int = 1
     min_frames_required: int = 20
     running: bool = False
@@ -262,6 +262,8 @@ class GuidedCharucoSession:
     captures_attempted: int = 0
     accepted_frames: int = 0
     last_detection_result: str = "session not started"
+    last_step_ok: bool = False
+    last_step_message: str = "Workflow not started yet."
     instruction: str = GUIDED_CHARUCO_INSTRUCTION
     quality_summary: Dict[str, Any] = field(default_factory=dict)
 
@@ -275,7 +277,7 @@ class GuidedCharucoWorkflowService:
     def start(
         self,
         *,
-        total_steps: int = 40,
+        total_steps: int = 10,
         min_frames_required: int = 20,
         charuco_squares_x: int = 7,
         charuco_squares_y: int = 5,
@@ -304,11 +306,34 @@ class GuidedCharucoWorkflowService:
             captures_attempted=0,
             accepted_frames=0,
             last_detection_result="session started",
+            last_step_ok=False,
+            last_step_message="Workflow started. Hold the board fully in view and press Capture Step.",
             instruction=GUIDED_CHARUCO_INSTRUCTION,
             quality_summary={},
         )
         self.last_intrinsics = None
         return self.status()
+
+    @staticmethod
+    def _step_text(current_step: int, total_steps: int) -> str:
+        step = max(0, int(current_step))
+        total = max(1, int(total_steps))
+        if step > total:
+            step = total
+        return f"Step {step} of {total}"
+
+    @staticmethod
+    def _friendly_step_message(accepted: bool, reason: str) -> str:
+        if accepted:
+            return "Step accepted. Move the board to a new angle and press Capture Step."
+        reason_l = str(reason).strip().lower()
+        if "aruco" in reason_l or "charuco" in reason_l:
+            return "Step not accepted. Keep the full board visible, move a bit closer, and retry."
+        if "checkerboard" in reason_l:
+            return "Step not accepted. Keep the full board in frame and retry."
+        if "empty frame" in reason_l:
+            return "Step not accepted. Camera frame was unavailable. Please retry."
+        return "Step not accepted. Move the board, keep it fully visible, and try again."
 
     def status(self) -> Dict[str, Any]:
         s = self.session
@@ -316,18 +341,25 @@ class GuidedCharucoWorkflowService:
             return {
                 "running": False,
                 "has_result": self.last_intrinsics is not None,
+                "step_text": "Step 0 of 0",
+                "last_step_ok": False,
+                "last_step_message": "Workflow not started yet.",
                 "instruction": GUIDED_CHARUCO_INSTRUCTION,
             }
+        step_text = self._step_text(s.current_step, s.total_steps)
         return {
             "running": bool(s.running),
             "solved": bool(s.solved),
             "calibration_ok": bool(s.calibration_ok),
             "current_step": int(s.current_step),
             "total_steps": int(s.total_steps),
+            "step_text": step_text,
             "captures_attempted": int(s.captures_attempted),
             "accepted_frames": int(s.accepted_frames),
             "min_frames_required": int(s.min_frames_required),
             "last_detection_result": str(s.last_detection_result),
+            "last_step_ok": bool(s.last_step_ok),
+            "last_step_message": str(s.last_step_message),
             "instruction": str(s.instruction),
             "quality_summary": dict(s.quality_summary),
             "has_result": self.last_intrinsics is not None,
@@ -338,6 +370,8 @@ class GuidedCharucoWorkflowService:
         if s is None or not s.running:
             raise RuntimeError("guided charuco workflow not running")
         if s.solved:
+            s.last_step_ok = bool(s.calibration_ok)
+            s.last_step_message = "Calibration already finished."
             return {
                 "ok": True,
                 "step_capture": False,
@@ -345,6 +379,8 @@ class GuidedCharucoWorkflowService:
                 "status": self.status(),
             }
         if s.captures_attempted >= s.total_steps:
+            s.last_step_ok = False
+            s.last_step_message = "All steps are already captured. Press Finish & Check."
             return {
                 "ok": False,
                 "step_capture": False,
@@ -358,6 +394,8 @@ class GuidedCharucoWorkflowService:
         s.captures_attempted += 1
         s.accepted_frames = int(capture.get("frames_used", s.accepted_frames))
         s.last_detection_result = reason
+        s.last_step_ok = bool(accepted)
+        s.last_step_message = self._friendly_step_message(accepted, reason)
 
         if s.captures_attempted < s.total_steps:
             s.current_step = s.captures_attempted + 1
@@ -415,6 +453,12 @@ class GuidedCharucoWorkflowService:
             s.calibration_ok = calibration_ok
             s.running = False
             s.solved = True
+            s.last_step_ok = bool(calibration_ok)
+            s.last_step_message = (
+                "Finished. Calibration quality looks good."
+                if calibration_ok
+                else "Finished, but quality is not good enough yet. Capture more varied board views and try again."
+            )
             self.last_intrinsics = result
             return {
                 "ok": True,
@@ -428,6 +472,8 @@ class GuidedCharucoWorkflowService:
             s.running = False
             s.solved = True
             s.calibration_ok = False
+            s.last_step_ok = False
+            s.last_step_message = "Could not finish calibration. Please retry with clear and varied board views."
             s.quality_summary = {
                 "ok": False,
                 "error": f"{type(e).__name__}: {e}",
