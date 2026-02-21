@@ -56,6 +56,11 @@ Optional environment overrides:
 - `SCANNER_MOCK_HW` (optional, enables hardwareless mode when set to `1/true/yes/on`)
 - `SCANNER_ENABLE_LEGACY_BACKGROUND_PATH` (optional, enables legacy background flow when set to `1/true/yes/on`)
 
+Camera orientation behavior:
+
+- Live preview/capture/calibration/scan frames are rotated by 180° by default via [`CameraSettings.rotation_degrees`](camera_service.py:35).
+- This keeps stream and saved/calibration frames orientation-consistent.
+
 Windows `cmd.exe` example with overrides:
 
 ```bash
@@ -116,6 +121,49 @@ Repeat until enough detections are collected.
 ```bash
 curl -X POST "http://<pi-ip>:8000/api/calibration/intrinsics/solve"
 ```
+
+### 3.2b Manual ChArUco intrinsics (guided 40-step workflow)
+
+Use this when you want explicit user-guided repositioning of the board for each capture.
+
+1. Start guided workflow (defaults to 40 steps):
+
+```bash
+curl -X POST "http://<pi-ip>:8000/api/calibration/intrinsics/charuco-manual/start?total_steps=40&min_frames=20"
+```
+
+2. For each step, manually move board to a **new pose**, then capture:
+
+```bash
+curl -X POST "http://<pi-ip>:8000/api/calibration/intrinsics/charuco-manual/capture"
+```
+
+Repeat until `40/40` is reached. Instruction text in API/UI is:
+
+- `Move board to a new pose manually, then capture.`
+
+3. Check progress/status at any time:
+
+```bash
+curl "http://<pi-ip>:8000/api/calibration/intrinsics/charuco-manual/status"
+```
+
+4. Final solve:
+
+- auto-runs on capture step 40, or
+- run manually:
+
+```bash
+curl -X POST "http://<pi-ip>:8000/api/calibration/intrinsics/charuco-manual/solve"
+```
+
+5. Pass/fail criteria (`quality_summary.ok`):
+
+- accepted frames >= `min_frames` (default 20)
+- RMS reprojection error <= 1.2
+- mean reprojection error <= 1.0 px
+
+When solve succeeds, intrinsics are persisted immediately to `calibration/calibration.json`.
 
 ### 3.3 Laser plane calibration
 
@@ -297,6 +345,13 @@ Core endpoints added in [`webapp.py`](webapp.py):
 - `POST /api/camera/profile/save?name=normal|laser`
 - `POST /api/camera/profile/load?name=normal|laser`
 - `POST /api/camera/profile/apply?name=normal|laser` (backward-compatible)
+
+Guided ChArUco workflow endpoints:
+
+- `POST /api/calibration/intrinsics/charuco-manual/start`
+- `POST /api/calibration/intrinsics/charuco-manual/capture`
+- `GET /api/calibration/intrinsics/charuco-manual/status`
+- `POST /api/calibration/intrinsics/charuco-manual/solve`
 
 These are safe in mock mode as well (`SCANNER_MOCK_HW=1`).
 

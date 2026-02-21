@@ -33,7 +33,7 @@ try:
     from .turntable import Turntable, TurntableConfig
     from .calibration_models import CalibrationData
     from .calibration_store import CalibrationStore
-    from .calibration_intrinsics import IntrinsicsCalibrationService
+    from .calibration_intrinsics import IntrinsicsCalibrationService, GuidedCharucoWorkflowService
     from .calibration_laser import LaserPlaneCalibrationService
 except ImportError:
     from scan_runner import ScanController, ScanConfig
@@ -52,7 +52,7 @@ except ImportError:
     from turntable import Turntable, TurntableConfig
     from calibration_models import CalibrationData
     from calibration_store import CalibrationStore
-    from calibration_intrinsics import IntrinsicsCalibrationService
+    from calibration_intrinsics import IntrinsicsCalibrationService, GuidedCharucoWorkflowService
     from calibration_laser import LaserPlaneCalibrationService
 
 log = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ STEPPER_HOLD_ON_START = True
 MOCK_HW = str(os.getenv("SCANNER_MOCK_HW", "")).strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_LEGACY_BACKGROUND_PATH = str(os.getenv("SCANNER_ENABLE_LEGACY_BACKGROUND_PATH", "")).strip().lower() in {"1", "true", "yes", "on"}
 
-camera = CameraService(CameraSettings(size=(1280, 720), jpeg_quality=80, fps=25.0, mock=MOCK_HW))
+camera = CameraService(CameraSettings(size=(1280, 720), jpeg_quality=80, fps=25.0, rotation_degrees=180, mock=MOCK_HW))
 detector = StripeDetector(StripeParams())
 
 bg = BackgroundModel(BackgroundParams(fg_threshold=25, morph_ksize=5, dilate_iters=1, use_otsu=False))
@@ -154,6 +154,7 @@ calibration_lock = threading.Lock()
 calibration_store = CalibrationStore("calibration/calibration.json")
 calibration_data = CalibrationData()
 intrinsics_cal = IntrinsicsCalibrationService()
+guided_charuco = GuidedCharucoWorkflowService(intrinsics_cal)
 laser_cal = LaserPlaneCalibrationService()
 
 state_lock = threading.Lock()
@@ -308,6 +309,16 @@ def index():
 
   <h3>Detector diagnostics</h3>
   <pre id="detector_diag" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap"></pre>
+
+  <h3>Manual ChArUco intrinsics (40-step guided)</h3>
+  <p>
+    <button onclick="startManualCharucoWorkflow()">Start 40-step workflow</button>
+    <button onclick="captureManualCharucoStep()">Capture current step</button>
+    <button onclick="solveManualCharucoWorkflow()">Solve now</button>
+  </p>
+  <p id="charuco_progress" style="font-weight:bold">Progress: not started</p>
+  <p id="charuco_instruction">Instruction: Move board to a new pose manually, then capture.</p>
+  <pre id="charuco_status" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap"></pre>
 
   <h3>Runs</h3>
   <button onclick="loadRuns()">Refresh runs</button>
@@ -464,13 +475,63 @@ async function loadRuns(){
   }
 }
 
+function renderManualCharucoStatus(payload){
+  const status = payload?.status || payload || {};
+  q('charuco_status').textContent = JSON.stringify(payload, null, 2);
+  const current = Number(status.current_step || 0);
+  const total = Number(status.total_steps || 40);
+  if(status.running){
+    q('charuco_progress').textContent = `Progress: ${current}/${total}`;
+  }else if(status.solved){
+    const ok = status.calibration_ok ? 'OK' : 'NOT OK';
+    const qs = status.quality_summary || {};
+    q('charuco_progress').textContent = `Progress: ${total}/${total} | Calibration ${ok} | frames=${qs.frames_used ?? 0}, rms=${qs.rms_reprojection_error ?? 'n/a'}, mean=${qs.mean_reprojection_error ?? 'n/a'}`;
+  }else{
+    q('charuco_progress').textContent = 'Progress: not started';
+  }
+  q('charuco_instruction').textContent = 'Instruction: ' + (status.instruction || 'Move board to a new pose manually, then capture.');
+}
+
+async function refreshManualCharucoStatus(){
+  try{
+    const r = await fetch('/api/calibration/intrinsics/charuco-manual/status');
+    const j = await r.json();
+    renderManualCharucoStatus(j);
+  }catch(e){
+    q('charuco_status').textContent = 'manual charuco status fetch failed: ' + e;
+  }
+}
+
+async function startManualCharucoWorkflow(){
+  const r = await fetch('/api/calibration/intrinsics/charuco-manual/start', {method:'POST'});
+  const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+  renderManualCharucoStatus(j);
+  return j;
+}
+
+async function captureManualCharucoStep(){
+  const r = await fetch('/api/calibration/intrinsics/charuco-manual/capture', {method:'POST'});
+  const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+  renderManualCharucoStatus(j);
+  return j;
+}
+
+async function solveManualCharucoWorkflow(){
+  const r = await fetch('/api/calibration/intrinsics/charuco-manual/solve', {method:'POST'});
+  const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+  renderManualCharucoStatus(j);
+  return j;
+}
+
 refreshScanStatus();
 refreshDetectorDiag();
 loadRuns();
 readCameraState();
+refreshManualCharucoStatus();
 setInterval(refreshScanStatus, 1000);
 setInterval(refreshDetectorDiag, 1000);
 setInterval(readCameraState, 2000);
+setInterval(refreshManualCharucoStatus, 1000);
 </script>
 </body>
 </html>
@@ -1034,8 +1095,79 @@ def api_calibration_status():
         "store_path": str(calibration_store.path),
         "data": _calibration_snapshot(),
         "intrinsics_session": intrinsics_cal.status(),
+        "guided_charuco_session": guided_charuco.status(),
         "laser_session": laser_cal.status(),
     }
+
+
+@app.post("/api/calibration/intrinsics/charuco-manual/start")
+def api_calibration_intrinsics_charuco_manual_start(
+    total_steps: int = 40,
+    min_frames: int = 20,
+    charuco_squares_x: int = 7,
+    charuco_squares_y: int = 5,
+    charuco_square_length_m: float = 0.02,
+    charuco_marker_length_m: float = 0.015,
+    aruco_dict_name: str = "DICT_4X4_50",
+):
+    try:
+        status = guided_charuco.start(
+            total_steps=int(total_steps),
+            min_frames_required=int(min_frames),
+            charuco_squares_x=int(charuco_squares_x),
+            charuco_squares_y=int(charuco_squares_y),
+            charuco_square_length_m=float(charuco_square_length_m),
+            charuco_marker_length_m=float(charuco_marker_length_m),
+            aruco_dict_name=str(aruco_dict_name),
+        )
+        return {"ok": True, "status": status}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.get("/api/calibration/intrinsics/charuco-manual/status")
+def api_calibration_intrinsics_charuco_manual_status():
+    return {"ok": True, "status": guided_charuco.status()}
+
+
+@app.post("/api/calibration/intrinsics/charuco-manual/capture")
+def api_calibration_intrinsics_charuco_manual_capture(settle_s: float = 0.05):
+    global calibration_data
+    with capture_lock:
+        frame = camera.grab_fresh_frame(settle_s=float(settle_s))
+    if frame is None:
+        return JSONResponse({"ok": False, "error": "camera frame unavailable"}, status_code=500)
+    try:
+        payload = guided_charuco.capture_step(frame)
+        intrinsics_obj = payload.get("intrinsics")
+        if intrinsics_obj is not None:
+            with calibration_lock:
+                calibration_data.intrinsics = intrinsics_obj
+                calibration_data = calibration_store.save(calibration_data)
+            payload["intrinsics"] = asdict(intrinsics_obj)
+            payload["persisted"] = True
+            payload["store_path"] = str(calibration_store.path)
+        return payload
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/calibration/intrinsics/charuco-manual/solve")
+def api_calibration_intrinsics_charuco_manual_solve():
+    global calibration_data
+    try:
+        payload = guided_charuco.solve_final()
+        intrinsics_obj = payload.get("intrinsics")
+        if intrinsics_obj is not None:
+            with calibration_lock:
+                calibration_data.intrinsics = intrinsics_obj
+                calibration_data = calibration_store.save(calibration_data)
+            payload["intrinsics"] = asdict(intrinsics_obj)
+            payload["persisted"] = True
+            payload["store_path"] = str(calibration_store.path)
+        return payload
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
 
 
 @app.post("/api/calibration/intrinsics/start")
@@ -1192,6 +1324,8 @@ def api_calibration_reset():
             calibration_data = reset_data
         intrinsics_cal.session = None
         intrinsics_cal.last_result = None
+        guided_charuco.session = None
+        guided_charuco.last_intrinsics = None
         laser_cal.session = None
         laser_cal.last_result = {}
         return {"ok": True, "store_path": str(calibration_store.path), "data": reset_data.to_dict()}
