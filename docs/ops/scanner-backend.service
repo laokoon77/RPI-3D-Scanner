@@ -1,0 +1,20 @@
+[Unit]
+Description=RPI 3D Scanner Backend (FastAPI/Uvicorn)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user
+Environment=PYTHONUNBUFFERED=1
+# End-user LAN browser access requires non-loopback bind.
+ExecStart=/usr/bin/bash -lc 'cd "/home/user/RPI 3D Scanner" && exec ./.venv/bin/python -m uvicorn webapp:app --host 0.0.0.0 --port 8000'
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=scanner-backend
+
+[Install]
+WantedBy=multi-user.target

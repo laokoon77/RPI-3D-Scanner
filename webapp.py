@@ -4,6 +4,8 @@ import logging
 import subprocess
 import sys
 import os
+import math
+import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -165,12 +167,14 @@ state_lock = threading.Lock()
 view_mode = "live"       # "live" or "overlay"
 active_laser = 1         # 1 or 2
 lasers_enabled = False   # if False => ALWAYS show "LASERS OFF" overlay
+laser1_on = False
+laser2_on = False
 latest_detector_telemetry: dict[str, Any] = {}
 
 
 @app.on_event("startup")
 def startup():
-    global gpio, stepper, laser1, laser2, turntable, calibration_data
+    global gpio, stepper, laser1, laser2, turntable, calibration_data, laser1_on, laser2_on
     
     camera.start()
 
@@ -181,6 +185,8 @@ def startup():
 
     laser_set(gpio, laser1, False)
     laser_set(gpio, laser2, False)
+    laser1_on = False
+    laser2_on = False
     
     turntable = Turntable(gpio, stepper, TurntableConfig(
         motor_steps_per_rev=200,
@@ -224,10 +230,13 @@ def startup():
 
 @app.on_event("shutdown")
 def shutdown():
+    global laser1_on, laser2_on
     try:
         if gpio and laser1 and laser2:
             laser_set(gpio, laser1, False)
             laser_set(gpio, laser2, False)
+            laser1_on = False
+            laser2_on = False
         if gpio and stepper:
             stepper_enable(gpio, stepper, False)
         if gpio:
@@ -245,6 +254,10 @@ def index():
 <body style="font-family:sans-serif;margin:16px">
   <h2>Pi Scanner</h2>
   <img src="/view.mjpg" style="max-width:100%;border:1px solid #ccc"/>
+  <div style="display:flex;gap:12px;align-items:center;margin-top:8px">
+    <label><input id="laser1_toggle" type="checkbox" onchange="setLaserToggle(1, this.checked)"/> Laser 1</label>
+    <label><input id="laser2_toggle" type="checkbox" onchange="setLaserToggle(2, this.checked)"/> Laser 2</label>
+  </div>
   <p><a href="/viewer/" target="_blank">Open viewer</a></p>
 
   <h3>View</h3>
@@ -318,7 +331,7 @@ def index():
   <p style="max-width:900px">Follow the guided steps. Move the board to a new angle each time, keep the full board visible, then press <b>Capture Step</b>.</p>
   <p>
     <label for="charuco_total_steps"><b>Number of steps</b></label>
-    <input id="charuco_total_steps" type="number" min="5" max="60" step="1" value="10" style="width:90px"/>
+    <input id="charuco_total_steps" type="number" min="5" max="60" step="1" value="20" style="width:90px"/>
     <button onclick="startManualCharucoWorkflow()">Start</button>
     <button onclick="captureManualCharucoStep()">Capture Step</button>
     <button onclick="solveManualCharucoWorkflow()">Finish &amp; Check</button>
@@ -326,6 +339,13 @@ def index():
   <p id="charuco_progress" style="font-size:1.2em;font-weight:700;margin:10px 0">Step 0 of 0</p>
   <p id="charuco_instruction">Move the board to a new angle, keep it fully visible, then press Capture Step.</p>
   <p id="charuco_step_feedback" style="display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid #ccc;font-weight:700;background:#f3f4f6;color:#111827">Not started</p>
+
+  <h3>Automatic Laser Calibration</h3>
+  <p style="max-width:900px">Runs a fixed fully-automatic routine (turntable poses, laser captures for both lasers, solve, and save) in one step.</p>
+  <p>
+    <button id="laser_auto_btn" onclick="startAutoLaserCalibration()">Run Auto Laser Calibration</button>
+  </p>
+  <pre id="laser_auto_status" style="background:#f6f6f6;padding:8px;border:1px solid #ddd;max-width:980px;white-space:pre-wrap">Not started</pre>
 
   <h3>Runs</h3>
   <button onclick="loadRuns()">Refresh runs</button>
@@ -347,12 +367,47 @@ async function post(url){
 
 function q(id){ return document.getElementById(id); }
 
+async function setLaserToggle(which, enabled){
+  const state = enabled ? 'on' : 'off';
+  const toggle = q(`laser${which}_toggle`);
+  try{
+    const r = await fetch(`/api/laser/${which}/${state}`, {method:'POST'});
+    const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+    if(!j.ok){
+      if(toggle) toggle.checked = !enabled;
+      console.error('laser toggle failed', which, j);
+      return j;
+    }
+    return j;
+  }catch(e){
+    if(toggle) toggle.checked = !enabled;
+    const out = {ok:false,error:String(e)};
+    console.error('laser toggle request failed', which, out);
+    return out;
+  }
+}
+
+async function initLaserToggles(){
+  try{
+    const r = await fetch('/api/laser/state');
+    const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+    if(!j?.ok) return;
+    if(q('laser1_toggle')) q('laser1_toggle').checked = Boolean(j.laser1_on);
+    if(q('laser2_toggle')) q('laser2_toggle').checked = Boolean(j.laser2_on);
+  }catch(e){
+    console.error('laser toggle init failed', e);
+  }
+}
+
 async function startScan(){
   const stepDeg = encodeURIComponent(q('scan_step_deg').value);
   const spanDeg = encodeURIComponent(q('scan_span_deg').value);
   const speed = encodeURIComponent(q('scan_speed').value);
   const saveImages = q('scan_save_images').checked ? 1 : 0;
-  await post(`/api/scan/start?step_deg=${stepDeg}&span_deg=${spanDeg}&speed=${speed}&save_images=${saveImages}`);
+  const j = await post(`/api/scan/start?step_deg=${stepDeg}&span_deg=${spanDeg}&speed=${speed}&save_images=${saveImages}`);
+  if(!j?.ok){
+    q('scan_status').textContent = 'scan start failed: ' + String(j?.error || 'unknown error');
+  }
 }
 
 function toNum(id){
@@ -483,19 +538,42 @@ async function loadRuns(){
 }
 
 function renderManualCharucoStatus(payload){
-  const status = payload?.status || payload || {};
-  const current = Number(status.current_step || 0);
-  const total = Number(status.total_steps || 0);
-  const defaultStepText = `Step ${Math.max(0, current)} of ${Math.max(0, total)}`;
-  q('charuco_progress').textContent = String(status.step_text || payload?.step_text || defaultStepText);
-  q('charuco_instruction').textContent = String(
-    status.instruction ||
-    'Move the board to a new angle, keep it fully visible, then press Capture Step.'
-  );
+  const status = payload?.status || {};
+  const framesCaptured = Number(payload?.frames_captured ?? status.frames_captured ?? 0);
+  const framesUsed = Number(payload?.frames_used ?? status.frames_used ?? 0);
+  const minFrames = Number(payload?.min_frames ?? status.min_frames ?? 0);
+
+  const hasGuidedStepText = typeof status.step_text === 'string' || typeof payload?.step_text === 'string';
+  const stepText = hasGuidedStepText
+    ? String(status.step_text || payload?.step_text || 'Step 0 of 0')
+    : (minFrames > 0
+        ? `Accepted ${Math.max(0, framesUsed)} / ${Math.max(0, minFrames)} frames (captured ${Math.max(0, framesCaptured)})`
+        : `Accepted ${Math.max(0, framesUsed)} frames (captured ${Math.max(0, framesCaptured)})`);
+  q('charuco_progress').textContent = stepText;
+  q('charuco_instruction').textContent = 'Use a checkerboard. Move it to varied angles, keep it fully visible, then press Capture Step.';
 
   const feedback = q('charuco_step_feedback');
-  const msg = String(status.last_step_message || payload?.last_step_message || 'Not started');
-  const ok = Boolean(status.last_step_ok ?? payload?.last_step_ok);
+  let msg = String(status.last_step_message || payload?.last_step_message || 'Not started');
+  if(payload?.intrinsics){
+    msg = 'Calibration solved and saved.';
+  }else if(typeof payload?.accepted === 'boolean'){
+    msg = payload.accepted
+      ? `Capture accepted (${Math.max(0, framesUsed)} / ${Math.max(0, minFrames || framesUsed)}).`
+      : `Capture rejected: ${String(payload?.reason || 'checkerboard not detected')}`;
+  }else if(payload?.status?.running && payload?.status?.board_type === 'checkerboard'){
+    msg = 'Checkerboard calibration started. Capture varied board poses.';
+  }else if(!payload?.ok && payload?.error){
+    msg = String(payload.error);
+  }
+
+  const ok = Boolean(
+    payload?.ok && (
+      payload?.intrinsics ||
+      payload?.accepted === true ||
+      status.last_step_ok === true ||
+      (payload?.status?.running && payload?.status?.board_type === 'checkerboard')
+    )
+  );
   feedback.textContent = msg;
   if(msg.toLowerCase().includes('not started')){
     feedback.style.background = '#f3f4f6';
@@ -514,11 +592,14 @@ function renderManualCharucoStatus(payload){
 
 async function refreshManualCharucoStatus(){
   try{
-    const r = await fetch('/api/calibration/intrinsics/charuco-manual/status');
+    const r = await fetch('/api/calibration/status');
     const j = await r.json();
-    renderManualCharucoStatus(j);
+    renderManualCharucoStatus({
+      ok: Boolean(j?.ok),
+      status: j?.intrinsics_session || {},
+    });
   }catch(e){
-    q('charuco_step_feedback').textContent = 'Could not refresh guided status. Please retry.';
+    q('charuco_step_feedback').textContent = 'Could not refresh calibration status. Please retry.';
     q('charuco_step_feedback').style.background = '#fee2e2';
     q('charuco_step_feedback').style.color = '#991b1b';
     q('charuco_step_feedback').style.borderColor = '#ef4444';
@@ -527,32 +608,72 @@ async function refreshManualCharucoStatus(){
 
 async function startManualCharucoWorkflow(){
   const rawSteps = Number(q('charuco_total_steps').value);
-  const safeSteps = Number.isFinite(rawSteps) ? Math.max(5, Math.min(60, Math.round(rawSteps))) : 10;
+  const safeSteps = Number.isFinite(rawSteps) ? Math.max(5, Math.min(60, Math.round(rawSteps))) : 20;
   q('charuco_total_steps').value = String(safeSteps);
-  const r = await fetch(`/api/calibration/intrinsics/charuco-manual/start?total_steps=${encodeURIComponent(safeSteps)}`, {method:'POST'});
+  const r = await fetch(`/api/calibration/intrinsics/start?board_type=checkerboard&min_frames=${encodeURIComponent(safeSteps)}`, {method:'POST'});
   const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
   renderManualCharucoStatus(j);
   return j;
 }
 
 async function captureManualCharucoStep(){
-  const r = await fetch('/api/calibration/intrinsics/charuco-manual/capture', {method:'POST'});
+  const settleInput = q('charuco_settle_s');
+  const settleValue = settleInput ? Number(settleInput.value) : NaN;
+  const hasSettle = Number.isFinite(settleValue) && settleValue >= 0;
+  const captureUrl = hasSettle
+    ? `/api/calibration/intrinsics/capture?settle_s=${encodeURIComponent(settleValue)}`
+    : '/api/calibration/intrinsics/capture';
+  const r = await fetch(captureUrl, {method:'POST'});
   const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
   renderManualCharucoStatus(j);
   return j;
 }
 
 async function solveManualCharucoWorkflow(){
-  const r = await fetch('/api/calibration/intrinsics/charuco-manual/solve', {method:'POST'});
+  const r = await fetch('/api/calibration/intrinsics/solve', {method:'POST'});
   const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
   renderManualCharucoStatus(j);
   return j;
+}
+
+function renderAutoLaserStatus(payload){
+  const target = q('laser_auto_status');
+  if(!target) return;
+  target.textContent = JSON.stringify(payload, null, 2);
+  if(payload?.ok){
+    target.style.background = '#dcfce7';
+    target.style.color = '#166534';
+    target.style.borderColor = '#22c55e';
+  }else{
+    target.style.background = '#fee2e2';
+    target.style.color = '#991b1b';
+    target.style.borderColor = '#ef4444';
+  }
+}
+
+async function startAutoLaserCalibration(){
+  const btn = q('laser_auto_btn');
+  if(btn) btn.disabled = true;
+  renderAutoLaserStatus({ok:true, running:true, message:'Auto laser calibration started...'});
+  try{
+    const r = await fetch('/api/calibration/laser/auto', {method:'POST'});
+    const j = await r.json().catch(()=>({ok:false,error:'non-json response'}));
+    renderAutoLaserStatus(j);
+    return j;
+  }catch(e){
+    const out = {ok:false,error:'auto laser calibration request failed', detail:String(e)};
+    renderAutoLaserStatus(out);
+    return out;
+  }finally{
+    if(btn) btn.disabled = false;
+  }
 }
 
 refreshScanStatus();
 refreshDetectorDiag();
 loadRuns();
 readCameraState();
+initLaserToggles();
 refreshManualCharucoStatus();
 setInterval(refreshScanStatus, 1000);
 setInterval(refreshDetectorDiag, 1000);
@@ -700,12 +821,15 @@ def api_view_laser(laser: int):
 
 @app.post("/api/lasers/enabled")
 def api_lasers_enabled(enabled: int):
-    global lasers_enabled
+    global lasers_enabled, laser1_on, laser2_on
     en = bool(enabled)
 
     if not en:
         laser_set(gpio, laser1, False)
         laser_set(gpio, laser2, False)
+        with state_lock:
+            laser1_on = False
+            laser2_on = False
 
     with state_lock:
         lasers_enabled = en
@@ -715,10 +839,14 @@ def api_lasers_enabled(enabled: int):
 
 @app.post("/api/background/capture")
 def api_background_capture(n: int = 15, settle_s: float = 0.05):
+    global laser1_on, laser2_on
     if not ENABLE_LEGACY_BACKGROUND_PATH:
         return JSONResponse({"ok": False, "error": "legacy background path disabled by feature flag"}, status_code=404)
     laser_set(gpio, laser1, False)
     laser_set(gpio, laser2, False)
+    with state_lock:
+        laser1_on = False
+        laser2_on = False
 
     frames = []
     n = max(3, min(int(n), 60))
@@ -825,9 +953,31 @@ def api_move_deg(deg: float, speed: float = 800.0, hold: int = 1):
 
 @app.post("/api/laser/{which}/{state}")
 def api_laser(which: int, state: str):
+    global laser1_on, laser2_on
+    if which not in (1, 2):
+        return JSONResponse({"ok": False, "error": "which must be 1 or 2"}, status_code=400)
+    if state not in ("on", "off"):
+        return JSONResponse({"ok": False, "error": "state must be on or off"}, status_code=400)
     target = laser1 if which == 1 else laser2
-    laser_set(gpio, target, state == "on")
-    return {"ok": True}
+    enabled = (state == "on")
+    laser_set(gpio, target, enabled)
+    with state_lock:
+        if which == 1:
+            laser1_on = enabled
+        else:
+            laser2_on = enabled
+    return {"ok": True, "which": int(which), "on": bool(enabled)}
+
+
+@app.get("/api/laser/state")
+def api_laser_state():
+    with state_lock:
+        return {
+            "ok": True,
+            "laser1_on": bool(laser1_on),
+            "laser2_on": bool(laser2_on),
+            "lasers_enabled": bool(lasers_enabled),
+        }
 
 
 @app.post("/api/camera/auto")
@@ -1029,6 +1179,24 @@ def _run_summary(run_dir: Path) -> dict:
     points_dir = run_dir / "points"
     step_files = list(points_dir.glob("step_*.npz")) if points_dir.exists() else []
     export_path = run_dir / "viewer_export.json"
+    xyz_path = run_dir / "viewer_export.xyz"
+    artifacts_path = run_dir / "export_artifacts.json"
+
+    artifacts_data: dict[str, Any] | None = None
+    if artifacts_path.exists():
+        try:
+            artifacts_data = json.loads(artifacts_path.read_text(encoding="utf-8"))
+        except Exception:
+            artifacts_data = None
+
+    xyz_written = bool(xyz_path.exists())
+    xyz_skip_reason: str | None = None
+    if artifacts_data is not None:
+        xyz_info = artifacts_data.get("xyz") if isinstance(artifacts_data, dict) else None
+        if isinstance(xyz_info, dict):
+            xyz_written = bool(xyz_info.get("written", xyz_path.exists()))
+            xyz_skip_reason = xyz_info.get("skip_reason")
+
     return {
         "run_id": run_dir.name,
         "run_relpath": run_dir.as_posix(),
@@ -1036,6 +1204,12 @@ def _run_summary(run_dir: Path) -> dict:
         "step_files": len(step_files),
         "export_exists": export_path.exists(),
         "export_relpath": export_path.as_posix(),
+        "xyz_exists": xyz_path.exists(),
+        "xyz_relpath": xyz_path.as_posix(),
+        "xyz_written": xyz_written,
+        "xyz_skip_reason": xyz_skip_reason,
+        "artifacts_exists": artifacts_path.exists(),
+        "artifacts_relpath": artifacts_path.as_posix(),
     }
 
 
@@ -1093,6 +1267,10 @@ def api_runs_export(run_id: str, output_name: str = "viewer_export.json"):
         "run_id": run_id,
         "out_path": output_path.as_posix(),
         "exists": output_path.exists(),
+        "xyz_path": output_path.with_suffix(".xyz").as_posix(),
+        "xyz_exists": output_path.with_suffix(".xyz").exists(),
+        "artifacts_path": (run_dir / "export_artifacts.json").as_posix(),
+        "artifacts_exists": (run_dir / "export_artifacts.json").exists(),
         "stdout": (proc.stdout or "").strip(),
     }
 
@@ -1114,6 +1292,24 @@ def _get_intrinsics_matrix() -> np.ndarray:
     return np.array(intr.camera_matrix, dtype=np.float64)
 
 
+def _rotate_board_plane_y(board_plane: list[float], yaw_deg: float) -> list[float]:
+    if len(board_plane) != 4:
+        raise ValueError("board_plane must have 4 values")
+    a, b, c, d = [float(x) for x in board_plane]
+    yaw = math.radians(float(yaw_deg))
+    cs = math.cos(yaw)
+    sn = math.sin(yaw)
+    nx = cs * a + sn * c
+    ny = b
+    nz = -sn * a + cs * c
+    n = np.array([nx, ny, nz], dtype=np.float64)
+    norm = float(np.linalg.norm(n))
+    if norm < 1e-12:
+        raise RuntimeError("invalid board plane normal")
+    n = n / norm
+    return [float(n[0]), float(n[1]), float(n[2]), float(d)]
+
+
 @app.get("/api/calibration/status")
 def api_calibration_status():
     return {
@@ -1128,19 +1324,20 @@ def api_calibration_status():
 
 @app.post("/api/calibration/intrinsics/charuco-manual/start")
 def api_calibration_intrinsics_charuco_manual_start(
-    total_steps: int = 10,
+    total_steps: int = 20,
     min_frames: int = 20,
     charuco_squares_x: int = 8,
     charuco_squares_y: int = 8,
     charuco_square_length_m: float = 0.015,
     charuco_marker_length_m: float = 0.011,
-    aruco_dict_name: str = "DICT_4X4_50",
+    aruco_dict_name: str = "DICT_4X4_1000",
 ):
     try:
         safe_total_steps = max(5, min(int(total_steps), 60))
+        safe_min_frames = max(1, min(int(min_frames), safe_total_steps))
         status = guided_charuco.start(
             total_steps=safe_total_steps,
-            min_frames_required=int(min_frames),
+            min_frames_required=safe_min_frames,
             charuco_squares_x=int(charuco_squares_x),
             charuco_squares_y=int(charuco_squares_y),
             charuco_square_length_m=float(charuco_square_length_m),
@@ -1234,15 +1431,15 @@ def api_calibration_intrinsics_charuco_manual_solve():
 @app.post("/api/calibration/intrinsics/start")
 def api_calibration_intrinsics_start(
     board_type: str = "checkerboard",
-    checkerboard_cols: int = 9,
-    checkerboard_rows: int = 6,
+    checkerboard_cols: int = 7,
+    checkerboard_rows: int = 7,
     square_size_m: float = 0.01,
     min_frames: int = 12,
     charuco_squares_x: int = 8,
     charuco_squares_y: int = 8,
     charuco_square_length_m: float = 0.015,
     charuco_marker_length_m: float = 0.011,
-    aruco_dict_name: str = "DICT_4X4_50",
+    aruco_dict_name: str = "DICT_4X4_1000",
 ):
     try:
         status = intrinsics_cal.start(
@@ -1269,7 +1466,13 @@ def api_calibration_intrinsics_capture(settle_s: float = 0.05):
     if frame is None:
         return JSONResponse({"ok": False, "error": "camera frame unavailable"}, status_code=500)
     try:
-        return intrinsics_cal.capture(frame)
+        capture_meta: dict[str, Any] = {
+            "source": "api.calibration.intrinsics.capture",
+            "settle_s": float(settle_s),
+            "rotation_degrees": int(camera.settings.rotation_degrees),
+            "transform_path": "camera.grab_fresh_frame -> CameraService._apply_frame_transform -> intrinsics.capture",
+        }
+        return intrinsics_cal.capture(frame, capture_meta=capture_meta)
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
 
@@ -1281,7 +1484,14 @@ def api_calibration_intrinsics_solve():
         result = intrinsics_cal.solve()
         with calibration_lock:
             calibration_data.intrinsics = result
-        return {"ok": True, "intrinsics": asdict(result), "quality": result.quality}
+            calibration_data = calibration_store.save(calibration_data)
+        return {
+            "ok": True,
+            "intrinsics": asdict(result),
+            "quality": result.quality,
+            "persisted": True,
+            "store_path": str(calibration_store.path),
+        }
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
 
@@ -1350,6 +1560,138 @@ def api_calibration_laser_solve():
         }
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/calibration/laser/auto")
+def api_calibration_laser_auto(
+    board_a: float = 0.0,
+    board_b: float = 0.0,
+    board_c: float = 1.0,
+    board_d: float = -0.30,
+    min_points_per_laser: int = 120,
+    settle_s: float = 0.06,
+    drop_n: int = 2,
+    move_speed: float = 500.0,
+):
+    global calibration_data
+
+    if turntable is None:
+        return JSONResponse({"ok": False, "error": "turntable unavailable"}, status_code=500)
+
+    try:
+        intrinsics_k = _get_intrinsics_matrix()
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": f"camera intrinsics unavailable: {type(e).__name__}: {e}"},
+            status_code=400,
+        )
+
+    board_plane = [float(board_a), float(board_b), float(board_c), float(board_d)]
+    pose_plan_deg = [0.0, 15.0, -15.0]
+    current_pose = 0.0
+    accepted_l1 = 0
+    accepted_l2 = 0
+    progress: list[dict[str, Any]] = []
+
+    with capture_lock:
+        try:
+            laser_cal.start(board_plane=board_plane, min_points_per_laser=int(min_points_per_laser))
+
+            frame = camera.grab_fresh_frame(settle_s=float(settle_s))
+            if frame is None:
+                raise RuntimeError("camera unavailable (no frame)")
+
+            for pose_deg in pose_plan_deg:
+                delta = float(pose_deg - current_pose)
+                if abs(delta) > 1e-9:
+                    turntable.move_deg(delta, speed_sps=float(move_speed), hold=True)
+                    current_pose = float(pose_deg)
+
+                pose_plane = _rotate_board_plane_y(board_plane, pose_deg)
+
+                cap1 = laser_cal.capture(
+                    laser_index=1,
+                    camera=camera,
+                    gpio=gpio,
+                    laser=laser1,
+                    detector=detector,
+                    intrinsics_k=intrinsics_k,
+                    settle_s=float(settle_s),
+                    drop_n=int(drop_n),
+                    board_plane=pose_plane,
+                )
+                if cap1.get("accepted"):
+                    accepted_l1 += 1
+
+                cap2 = laser_cal.capture(
+                    laser_index=2,
+                    camera=camera,
+                    gpio=gpio,
+                    laser=laser2,
+                    detector=detector,
+                    intrinsics_k=intrinsics_k,
+                    settle_s=float(settle_s),
+                    drop_n=int(drop_n),
+                    board_plane=pose_plane,
+                )
+                if cap2.get("accepted"):
+                    accepted_l2 += 1
+
+                progress.append(
+                    {
+                        "pose_deg": float(pose_deg),
+                        "laser1": {
+                            "accepted": bool(cap1.get("accepted", False)),
+                            "reason": str(cap1.get("reason", "ok")),
+                            "points": int(cap1.get("points", 0) or 0),
+                        },
+                        "laser2": {
+                            "accepted": bool(cap2.get("accepted", False)),
+                            "reason": str(cap2.get("reason", "ok")),
+                            "points": int(cap2.get("points", 0) or 0),
+                        },
+                    }
+                )
+
+            if accepted_l1 < 2 or accepted_l2 < 2:
+                raise RuntimeError(
+                    "insufficient valid captures: need >=2 accepted captures per laser "
+                    f"(got L1={accepted_l1}, L2={accepted_l2})"
+                )
+
+            solved = laser_cal.solve(intrinsics_k)
+            with calibration_lock:
+                calibration_data.laser1 = solved.get(1)
+                calibration_data.laser2 = solved.get(2)
+                calibration_data = calibration_store.save(calibration_data)
+
+            return {
+                "ok": True,
+                "message": "Automatic laser calibration completed and saved.",
+                "pose_plan_deg": pose_plan_deg,
+                "accepted_captures": {"laser1": int(accepted_l1), "laser2": int(accepted_l2)},
+                "progress": progress,
+                "laser1": asdict(solved[1]),
+                "laser2": asdict(solved[2]),
+                "store_path": str(calibration_store.path),
+            }
+        except Exception as e:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": f"automatic laser calibration failed: {type(e).__name__}: {e}",
+                    "pose_plan_deg": pose_plan_deg,
+                    "accepted_captures": {"laser1": int(accepted_l1), "laser2": int(accepted_l2)},
+                    "progress": progress,
+                },
+                status_code=400,
+            )
+        finally:
+            try:
+                if abs(current_pose) > 1e-9:
+                    turntable.move_deg(-current_pose, speed_sps=float(move_speed), hold=True)
+            except Exception:
+                pass
 
 
 @app.post("/api/calibration/save")

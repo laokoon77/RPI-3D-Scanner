@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +15,8 @@ except ImportError:
 
 
 log = logging.getLogger(__name__)
+
+_CHECKERBOARD_DEBUG_DIR = Path("calibration") / "debug"
 
 
 def checkerboard_object_points(cols: int, rows: int, square_size: float) -> np.ndarray:
@@ -76,6 +79,8 @@ def charuco_runtime_diagnostics() -> Dict[str, Any]:
 _CANDIDATE_ARUCO_DICTS = [
     "DICT_4X4_50",
     "DICT_4X4_100",
+    "DICT_4X4_250",
+    "DICT_4X4_1000",
     "DICT_5X5_50",
     "DICT_5X5_100",
     "DICT_6X6_50",
@@ -96,8 +101,21 @@ _CANDIDATE_CHARUCO_DIMS = [
 
 
 def _get_aruco_dictionary(dict_name: str):
-    dict_id = getattr(cv2.aruco, dict_name, cv2.aruco.DICT_4X4_50)
+    dict_id = getattr(cv2.aruco, dict_name, cv2.aruco.DICT_4X4_1000)
     return cv2.aruco.getPredefinedDictionary(dict_id)
+
+
+def _apply_charuco_legacy_pattern(board, enabled: bool = True) -> None:
+    """Enable OpenCV legacy ChArUco pattern compatibility when supported."""
+    if board is None:
+        return
+    if not enabled:
+        return
+    try:
+        if hasattr(board, "setLegacyPattern"):
+            board.setLegacyPattern(True)
+    except Exception:
+        pass
 
 
 def _make_lenient_detector_params():
@@ -216,10 +234,10 @@ def _charuco_detect_board(gray: np.ndarray, board) -> Tuple[Optional[np.ndarray]
             # We need marker corners/ids for this — detect them first
             det_params = _make_lenient_detector_params()
             if hasattr(a, "ArucoDetector"):
-                det = a.ArucoDetector(board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50), det_params) if det_params is not None else a.ArucoDetector(board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
+                det = a.ArucoDetector(board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000), det_params) if det_params is not None else a.ArucoDetector(board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000))
                 mc, mi, _ = det.detectMarkers(gray)
             elif hasattr(a, "detectMarkers"):
-                mc, mi, _ = a.detectMarkers(gray, board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
+                mc, mi, _ = a.detectMarkers(gray, board.getDictionary() if hasattr(board, "getDictionary") else cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000))
             else:
                 mc, mi = None, None
             if mi is not None and len(mi) >= 1:
@@ -257,6 +275,53 @@ def _frame_diagnostics(gray: np.ndarray) -> Dict[str, Any]:
     }
 
 
+def _array_basic_stats(img: np.ndarray) -> Dict[str, Any]:
+    arr = np.asarray(img)
+    return {
+        "shape": [int(x) for x in arr.shape],
+        "dtype": str(arr.dtype),
+        "min": float(np.min(arr)) if arr.size else 0.0,
+        "max": float(np.max(arr)) if arr.size else 0.0,
+        "mean": float(np.mean(arr)) if arr.size else 0.0,
+    }
+
+
+def _to_gray_for_detection(frame: np.ndarray) -> np.ndarray:
+    if frame is None:
+        raise ValueError("frame is None")
+    if frame.ndim == 2:
+        gray = frame
+    elif frame.ndim == 3 and frame.shape[2] >= 3:
+        # CameraService provides RGB888 frames; keep this conversion consistent.
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    else:
+        raise ValueError(f"unsupported frame shape for grayscale conversion: {tuple(frame.shape)}")
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+    return gray
+
+
+def _save_checkerboard_debug_frames(rgb: np.ndarray, gray: np.ndarray, frame_index: int) -> Dict[str, str]:
+    paths: Dict[str, str] = {}
+    try:
+        _CHECKERBOARD_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) if rgb.ndim == 3 else rgb
+        rgb_path = _CHECKERBOARD_DEBUG_DIR / "checkerboard_capture_last_rgb.png"
+        gray_path = _CHECKERBOARD_DEBUG_DIR / "checkerboard_capture_last_gray.png"
+        idx_path = _CHECKERBOARD_DEBUG_DIR / f"checkerboard_capture_{int(frame_index):04d}.png"
+        cv2.imwrite(str(rgb_path), rgb_bgr)
+        cv2.imwrite(str(gray_path), gray)
+        cv2.imwrite(str(idx_path), gray)
+        paths = {
+            "last_rgb": str(rgb_path),
+            "last_gray": str(gray_path),
+            "indexed_gray": str(idx_path),
+        }
+    except Exception:
+        log.exception("checkerboard.capture.debug_save_failed")
+    return paths
+
+
 @dataclass
 class IntrinsicsSession:
     board_type: str = "checkerboard"  # checkerboard|charuco
@@ -268,7 +333,7 @@ class IntrinsicsSession:
     charuco_squares_y: int = 8
     charuco_square_length_m: float = 0.015
     charuco_marker_length_m: float = 0.011
-    aruco_dict_name: str = "DICT_4X4_50"
+    aruco_dict_name: str = "DICT_4X4_1000"
 
     frames_captured: int = 0
     frames_used: int = 0
@@ -301,6 +366,8 @@ class IntrinsicsCalibrationService:
         return {
             "running": True,
             "board_type": s.board_type,
+            "checkerboard_cols": int(s.checkerboard_cols),
+            "checkerboard_rows": int(s.checkerboard_rows),
             "frames_captured": s.frames_captured,
             "frames_used": s.frames_used,
             "min_frames": s.min_frames,
@@ -308,20 +375,146 @@ class IntrinsicsCalibrationService:
             "has_result": self.last_result is not None,
         }
 
-    def _capture_checkerboard(self, rgb: np.ndarray, s: IntrinsicsSession) -> Tuple[bool, str]:
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        pattern = (int(s.checkerboard_cols), int(s.checkerboard_rows))
+    def _capture_checkerboard(self, rgb: np.ndarray, s: IntrinsicsSession, capture_meta: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+        gray = _to_gray_for_detection(rgb)
+        rgb_stats = _array_basic_stats(rgb)
+        gray_stats = _array_basic_stats(gray)
+        diag = _frame_diagnostics(gray)
+        debug_paths = _save_checkerboard_debug_frames(rgb, gray, int(s.frames_captured))
         flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
-        found, corners = cv2.findChessboardCorners(gray, pattern, flags)
+        configured = (int(s.checkerboard_cols), int(s.checkerboard_rows))
+        transform_path = "camera.grab_fresh_frame -> CameraService._apply_frame_transform -> intrinsics.capture"
+        if isinstance(capture_meta, dict) and capture_meta:
+            transform_path = str(capture_meta.get("transform_path", transform_path))
+        log.info(
+            "checkerboard.capture.begin configured=%sx%s frames_captured=%d frames_used=%d transform_path=%s rgb_shape=%s rgb_dtype=%s rgb_min=%.1f rgb_max=%.1f rgb_mean=%.2f gray_shape=%s gray_dtype=%s gray_min=%.1f gray_max=%.1f gray_mean=%.2f p10=%.1f p50=%.1f p90=%.1f lap_var=%.2f debug_paths=%s",
+            int(configured[0]),
+            int(configured[1]),
+            int(s.frames_captured),
+            int(s.frames_used),
+            transform_path,
+            rgb_stats["shape"],
+            rgb_stats["dtype"],
+            float(rgb_stats["min"]),
+            float(rgb_stats["max"]),
+            float(rgb_stats["mean"]),
+            gray_stats["shape"],
+            gray_stats["dtype"],
+            float(gray_stats["min"]),
+            float(gray_stats["max"]),
+            float(gray_stats["mean"]),
+            float(diag["p10"]),
+            float(diag["p50"]),
+            float(diag["p90"]),
+            float(diag["laplacian_var"]),
+            debug_paths,
+        )
+
+        # Try configured pattern first, then an inner-corner interpretation fallback.
+        # Example: physical 8x8 squares => 7x7 inner corners for OpenCV.
+        attempted_patterns: list[tuple[int, int]] = [configured]
+        if configured[0] > 2 and configured[1] > 2:
+            fallback = (configured[0] - 1, configured[1] - 1)
+            if fallback not in attempted_patterns:
+                attempted_patterns.append(fallback)
+
+        found = False
+        corners = None
+        used_pattern = configured
+        used_detector = "none"
+        attempt_details: list[dict[str, Any]] = []
+
+        for pattern in attempted_patterns:
+            # 1) classic findChessboardCorners with adaptive+normalize flags
+            found_std, corners_std = cv2.findChessboardCorners(gray, pattern, flags=flags)
+            std_corners = int(len(corners_std)) if corners_std is not None else 0
+            found_sb = False
+            corners_sb = None
+            # 2) run SB detector on the same exact grayscale frame for diagnostics/comparison
+            if hasattr(cv2, "findChessboardCornersSB"):
+                try:
+                    found_sb, corners_sb = cv2.findChessboardCornersSB(gray, pattern)
+                except Exception:
+                    found_sb, corners_sb = False, None
+            sb_corners = int(len(corners_sb)) if corners_sb is not None else 0
+
+            if found_std and corners_std is not None:
+                found, corners = True, corners_std
+                used_pattern = pattern
+                used_detector = "classic"
+            elif found_sb and corners_sb is not None:
+                found, corners = True, corners_sb
+                used_pattern = pattern
+                used_detector = "sb"
+            attempt_details.append(
+                {
+                    "pattern": [int(pattern[0]), int(pattern[1])],
+                    "classic_found": bool(found_std),
+                    "classic_corners": std_corners,
+                    "sb_found": bool(found_sb),
+                    "sb_corners": sb_corners,
+                }
+            )
+            log.info(
+                "checkerboard.capture.try pattern=%sx%s classic_found=%s classic_corners=%d sb_found=%s sb_corners=%d",
+                int(pattern[0]),
+                int(pattern[1]),
+                bool(found_std),
+                int(std_corners),
+                bool(found_sb),
+                int(sb_corners),
+            )
+            if found:
+                break
+
         if not found or corners is None:
+            log.warning(
+                "checkerboard.capture.reject frame=%sx%s configured=%sx%s attempted=%s details=%s mean=%.2f std=%.2f lap_var=%.2f reason=checkerboard_not_found",
+                int(gray.shape[1]),
+                int(gray.shape[0]),
+                int(configured[0]),
+                int(configured[1]),
+                attempted_patterns,
+                attempt_details,
+                float(diag["mean"]),
+                float(diag["std"]),
+                float(diag["laplacian_var"]),
+            )
             return False, "checkerboard not found"
 
         term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-3)
         refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), term)
 
-        s.object_points.append(checkerboard_object_points(s.checkerboard_cols, s.checkerboard_rows, s.square_size_m))
+        if used_pattern != configured:
+            log.warning(
+                "checkerboard.capture.auto_adjust configured=%sx%s detected=%sx%s detector=%s",
+                int(configured[0]),
+                int(configured[1]),
+                int(used_pattern[0]),
+                int(used_pattern[1]),
+                used_detector,
+            )
+            # Persist detected inner-corner interpretation for next frames.
+            s.checkerboard_cols = int(used_pattern[0])
+            s.checkerboard_rows = int(used_pattern[1])
+
+        log.info(
+            "checkerboard.capture.accept frame=%sx%s configured=%sx%s used=%sx%s detector=%s details=%s",
+            int(gray.shape[1]),
+            int(gray.shape[0]),
+            int(configured[0]),
+            int(configured[1]),
+            int(used_pattern[0]),
+            int(used_pattern[1]),
+            used_detector,
+            attempt_details,
+        )
+
+        s.object_points.append(checkerboard_object_points(int(used_pattern[0]), int(used_pattern[1]), s.square_size_m))
         s.image_points.append(refined.reshape(-1, 2).astype(np.float32))
         s.frames_used += 1
+        if used_pattern != configured:
+            return True, f"checkerboard captured (auto-adjusted to inner corners {used_pattern[0]}x{used_pattern[1]})"
         return True, "checkerboard captured"
 
     def _capture_charuco(self, rgb: np.ndarray, s: IntrinsicsSession) -> Tuple[bool, str]:
@@ -352,6 +545,7 @@ class IntrinsicsCalibrationService:
             float(s.charuco_marker_length_m),
             dictionary,
         )
+        _apply_charuco_legacy_pattern(board, True)
         corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
         marker_count = 0 if ids is None else int(len(ids))
         log.info("charuco.capture.markers dict=%s marker_count=%d", s.aruco_dict_name, marker_count)
@@ -375,6 +569,7 @@ class IntrinsicsCalibrationService:
                     float(s.charuco_marker_length_m),
                     dictionary,
                 )
+                _apply_charuco_legacy_pattern(board, True)
                 corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
                 marker_count = 0 if ids is None else int(len(ids))
                 log.info("charuco.capture.markers_after_autotune dict=%s marker_count=%d", s.aruco_dict_name, marker_count)
@@ -382,12 +577,8 @@ class IntrinsicsCalibrationService:
                 log.warning("charuco.capture.reject reason=not_enough_aruco_markers marker_count=%d dict=%s", marker_count, s.aruco_dict_name)
                 return False, "not enough aruco markers"
 
-        # Use the lenient CharucoDetector helper (tries CharucoDetector with lenient
-        # params, then legacy interpolateCornersCharuco, across multiple image variants)
         ch_corners, ch_ids = _charuco_detect_board(gray, board)
-
         if ch_corners is None or ch_ids is None or len(ch_ids) < 4:
-            # Try auto-tune dictionary/dims then retry
             auto = self._auto_tune_charuco_from_frame(gray, s)
             log.info(
                 "charuco.capture.autotune retuned=%s dict=%s dims=%s score=%s",
@@ -404,21 +595,23 @@ class IntrinsicsCalibrationService:
                     float(s.charuco_marker_length_m),
                     dictionary,
                 )
-                ch2, ci2 = _charuco_detect_board(gray, board)
-                n2 = 0 if ci2 is None else int(len(ci2))
-                cur = 0 if ch_ids is None else int(len(ch_ids))
-                if n2 > cur:
-                    ch_corners, ch_ids = ch2, ci2
+                _apply_charuco_legacy_pattern(board, True)
+                corners, ids, _rej = _detect_aruco_markers(gray, dictionary)
+                if ids is not None and len(ids) >= 2:
+                    ch_corners, ch_ids = _charuco_detect_board(gray, board)
 
         if ch_corners is None or ch_ids is None or len(ch_ids) < 4:
             corner_count = 0 if ch_ids is None else int(len(ch_ids))
             log.warning(
-                "charuco.capture.reject reason=not_enough_charuco_corners dict=%s dims=%sx%s marker_count=%d corner_count=%d",
+                "charuco.capture.reject reason=not_enough_charuco_corners dict=%s dims=%sx%s marker_count=%d corner_count=%d lap_var=%.2f mean=%.2f std=%.2f",
                 s.aruco_dict_name,
                 int(s.charuco_squares_x),
                 int(s.charuco_squares_y),
                 marker_count,
                 corner_count,
+                float(diag["laplacian_var"]),
+                float(diag["mean"]),
+                float(diag["std"]),
             )
             return False, "not enough charuco corners"
 
@@ -464,6 +657,7 @@ class IntrinsicsCalibrationService:
                         float(s.charuco_marker_length_m),
                         dictionary,
                     )
+                    _apply_charuco_legacy_pattern(board, True)
                     corner_count = 0
                     if hasattr(cv2.aruco, "interpolateCornersCharuco"):
                         n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
@@ -507,7 +701,7 @@ class IntrinsicsCalibrationService:
             "score": int(best["score"]),
         }
 
-    def capture(self, rgb: np.ndarray) -> Dict[str, Any]:
+    def capture(self, rgb: np.ndarray, capture_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if self.session is None:
             raise RuntimeError("intrinsics calibration not started")
         if rgb is None:
@@ -520,7 +714,7 @@ class IntrinsicsCalibrationService:
             s.image_size = (int(w), int(h))
 
         if s.board_type == "checkerboard":
-            accepted, reason = self._capture_checkerboard(rgb, s)
+            accepted, reason = self._capture_checkerboard(rgb, s, capture_meta=capture_meta)
         else:
             accepted, reason = self._capture_charuco(rgb, s)
 
@@ -565,6 +759,7 @@ class IntrinsicsCalibrationService:
                 float(s.charuco_marker_length_m),
                 dictionary,
             )
+            _apply_charuco_legacy_pattern(board, True)
             if hasattr(cv2.aruco, "calibrateCameraCharuco"):
                 rms, k, dist, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
                     s.charuco_corners,
@@ -606,6 +801,7 @@ class IntrinsicsCalibrationService:
                 "square_length_m": float(s.charuco_square_length_m),
                 "marker_length_m": float(s.charuco_marker_length_m),
                 "aruco_dict": s.aruco_dict_name,
+                "legacy_pattern": True,
             }
 
         rms_f = float(rms)
@@ -665,16 +861,16 @@ class GuidedCharucoWorkflowService:
     def start(
         self,
         *,
-        total_steps: int = 10,
+        total_steps: int = 20,
         min_frames_required: int = 20,
         charuco_squares_x: int = 8,
         charuco_squares_y: int = 8,
         charuco_square_length_m: float = 0.015,
         charuco_marker_length_m: float = 0.011,
-        aruco_dict_name: str = "DICT_4X4_50",
+        aruco_dict_name: str = "DICT_4X4_1000",
     ) -> Dict[str, Any]:
         steps = max(1, int(total_steps))
-        min_frames = max(1, int(min_frames_required))
+        min_frames = max(1, min(int(min_frames_required), steps))
         self._intrinsics.start(
             board_type="charuco",
             min_frames=min_frames,

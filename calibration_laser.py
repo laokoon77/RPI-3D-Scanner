@@ -222,6 +222,26 @@ class LaserPlaneCalibrationService:
         s = self.session
         out: Dict[int, LaserPlaneCalibration] = {}
         for laser in (1, 2):
+            sample_planes = [
+                np.array(smp.plane, dtype=np.float64)
+                for smp in s.samples
+                if smp.laser == laser and len(smp.plane) == 4
+            ]
+            if len(sample_planes) < 2:
+                raise RuntimeError(
+                    f"laser {laser} needs at least 2 captures with different board poses"
+                )
+            first = sample_planes[0]
+            diverse = any(
+                (np.linalg.norm(pl[:3] - first[:3]) > 1e-6) or (abs(float(pl[3] - first[3])) > 1e-6)
+                for pl in sample_planes[1:]
+            )
+            if not diverse:
+                raise RuntimeError(
+                    f"laser {laser} degenerate solve: all captures use the same board plane; "
+                    "capture with at least two different board poses/planes"
+                )
+
             xyz, sample_count = self._collect_xyz_for_laser(laser, intrinsics_k)
             if xyz.shape[0] < int(s.min_points_per_laser):
                 raise RuntimeError(

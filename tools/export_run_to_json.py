@@ -85,7 +85,7 @@ def export_run(
     scale_r: float,
     x_center: float | None,
     calibration_path: Path,
-) -> None:
+) -> dict[str, Any]:
     points_dir = run_dir / "points"
     if not points_dir.exists() or not points_dir.is_dir():
         raise FileNotFoundError(f"missing points directory: {points_dir}")
@@ -190,6 +190,56 @@ def export_run(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    xyz_points: list[list[float]] = []
+    for step in steps:
+        xyz_points.extend(step.get("laser1_xyz", []))
+        xyz_points.extend(step.get("laser2_xyz", []))
+
+    xyz_path = output_path.with_suffix(".xyz")
+    xyz_written = False
+    xyz_reason: str | None = None
+
+    if calibration is None:
+        xyz_reason = "triangulation unavailable (invalid or missing calibration)"
+    elif len(xyz_points) <= 0:
+        xyz_reason = "no triangulated points"
+    else:
+        xyz_path.parent.mkdir(parents=True, exist_ok=True)
+        with xyz_path.open("w", encoding="utf-8", newline="\n") as f:
+            for p in xyz_points:
+                if len(p) < 3:
+                    continue
+                f.write(f"{float(p[0]):.6f} {float(p[1]):.6f} {float(p[2]):.6f}\n")
+        xyz_written = True
+
+    artifacts: dict[str, Any] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "json": {
+            "path": output_path.as_posix(),
+            "exists": output_path.exists(),
+        },
+        "xyz": {
+            "path": xyz_path.as_posix(),
+            "exists": xyz_path.exists(),
+            "written": xyz_written,
+            "points": int(len(xyz_points)),
+            "skipped": not xyz_written,
+            "skip_reason": xyz_reason,
+        },
+        "triangulation": {
+            "enabled": bool(calibration is not None),
+            "calibration_error": calibration_error,
+            "stats": tri_stats,
+        },
+    }
+
+    payload["artifacts"] = artifacts
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    artifacts_path = run_dir / "export_artifacts.json"
+    artifacts_path.write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
+    return artifacts
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -224,7 +274,7 @@ def main() -> int:
     run_dir = args.run_dir
     output = args.output if args.output is not None else (run_dir / "viewer_export.json")
 
-    export_run(
+    artifacts = export_run(
         run_dir=run_dir,
         output_path=output,
         scale_y=float(args.scale_y),
@@ -234,6 +284,10 @@ def main() -> int:
     )
 
     print(f"Exported {output}")
+    if artifacts.get("xyz", {}).get("written"):
+        print(f"XYZ {artifacts['xyz']['path']}")
+    else:
+        print(f"XYZ skipped: {artifacts.get('xyz', {}).get('skip_reason')}")
     return 0
 
 

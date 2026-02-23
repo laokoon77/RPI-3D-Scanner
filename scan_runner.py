@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import time
 import threading
 from dataclasses import dataclass, asdict
@@ -65,6 +67,8 @@ class ScanStatus:
     message: str = ""
     error: Optional[str] = None
     telemetry: Optional[Dict[str, Any]] = None
+    artifacts: Optional[Dict[str, Any]] = None
+    export_error: Optional[str] = None
 
 
 def _now_run_id() -> str:
@@ -181,6 +185,8 @@ class ScanController:
                 total_captures=plan.captures_count,
                 message="Starting...",
                 error=None,
+                artifacts=None,
+                export_error=None,
             )
 
         self._stop.clear()
@@ -209,10 +215,12 @@ class ScanController:
         try:
             # Always rotate in one direction for backlash reasons
             step_deg = plan.actual_step_deg
+            completed = True
 
             for i in range(plan.captures_count):
                 if self._stop.is_set():
                     self._set_status(message="Stopped by user")
+                    completed = False
                     break
 
                 angle_deg = i * step_deg
@@ -318,7 +326,53 @@ class ScanController:
                     self.turntable.move_deg(step_deg, speed_sps=cfg.move_speed_sps, hold=True)
                     time.sleep(cfg.settle_after_move_s)
 
-            self._set_status(running=False, message="Done", telemetry=dict(self._latest_telemetry))
+            export_error: Optional[str] = None
+            artifacts: Optional[Dict[str, Any]] = None
+            if completed:
+                try:
+                    export_tool = Path(__file__).resolve().parent / "tools" / "export_run_to_json.py"
+                    export_json = out_dir / "viewer_export.json"
+                    cmd = [
+                        sys.executable,
+                        str(export_tool),
+                        str(out_dir),
+                        "--output",
+                        str(export_json),
+                    ]
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    if proc.returncode != 0:
+                        export_error = (proc.stderr or proc.stdout or "export failed").strip()
+                    else:
+                        artifacts_file = out_dir / "export_artifacts.json"
+                        if artifacts_file.exists():
+                            artifacts = json.loads(artifacts_file.read_text(encoding="utf-8"))
+                        else:
+                            xyz_path = export_json.with_suffix(".xyz")
+                            artifacts = {
+                                "json": {"path": export_json.as_posix(), "exists": export_json.exists()},
+                                "xyz": {
+                                    "path": xyz_path.as_posix(),
+                                    "exists": xyz_path.exists(),
+                                    "written": xyz_path.exists(),
+                                    "skipped": not xyz_path.exists(),
+                                    "skip_reason": None if xyz_path.exists() else "not generated",
+                                },
+                            }
+                except Exception as e:
+                    export_error = f"{type(e).__name__}: {e}"
+
+            done_message = "Done"
+            if export_error:
+                done_message = "Done (export warning)"
+                print(f"[scan_runner] export warning for run {out_dir.name}: {export_error}")
+
+            self._set_status(
+                running=False,
+                message=done_message,
+                telemetry=dict(self._latest_telemetry),
+                artifacts=artifacts,
+                export_error=export_error,
+            )
 
         except Exception as e:
             self._set_status(running=False, error=f"{type(e).__name__}: {e}", message="Error", telemetry=dict(self._latest_telemetry))
